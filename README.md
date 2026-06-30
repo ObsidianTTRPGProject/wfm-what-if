@@ -2,9 +2,9 @@
 
 A single-file, browser-based **workforce-management what-if simulator** for service-desk and contact-centre planning. Model a roster, then ask questions like *"What if we add 2 hours of training per person this week — what happens to service level?"* and see the impact instantly.
 
-**[▶ Launch the tool](https://YOUR-GITHUB-USERNAME.github.io/wfm-what-if/)**
+**[▶ Launch the tool](https://obsidianttrpgproject.github.io/wfm-what-if/)**
 
-> Update the link above once GitHub Pages is enabled (see below).
+Source: [github.com/ObsidianTTRPGProject/wfm-what-if](https://github.com/ObsidianTTRPGProject/wfm-what-if)
 
 ## What it does
 
@@ -27,7 +27,7 @@ This repo is ready to publish as-is:
 1. Push the repo to GitHub.
 2. Go to **Settings → Pages**.
 3. Under **Build and deployment**, set **Source** to *Deploy from a branch*, choose your default branch (e.g. `main`) and the `/ (root)` folder, then **Save**.
-4. After a minute the site is live at `https://<your-username>.github.io/wfm-what-if/`, served from `index.html`.
+4. After a minute the site is live at `https://obsidianttrpgproject.github.io/wfm-what-if/`, served from `index.html`.
 
 The included `.nojekyll` file disables Jekyll processing so the static HTML is served verbatim.
 
@@ -39,6 +39,10 @@ LICENSE        MIT
 .nojekyll      Tells GitHub Pages to skip Jekyll
 .gitignore
 ```
+
+## Author
+
+JoshP
 
 ## License
 
