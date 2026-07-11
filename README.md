@@ -31,6 +31,16 @@ This repo is ready to publish as-is:
 
 The included `.nojekyll` file disables Jekyll processing so the static HTML is served verbatim.
 
+## Testing
+
+Run the engine regression checks with Node.js (no install step is required):
+
+```bash
+npm test
+```
+
+For local browser testing, run `npm start` and open `http://127.0.0.1:8765/`.
+
 ## Project layout
 
 ```

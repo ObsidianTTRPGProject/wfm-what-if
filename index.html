@@ -7,8 +7,42 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Instrument+Serif&family=Inter+Tight:wght@400;500;600;700&display=swap" rel="stylesheet">
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script>
+  // Fail loudly if a CDN script doesn't load (offline / blocked network): without this the
+  // page stays permanently blank with no message ("black screen") because the main script
+  // throws "React is not defined" before anything renders.
+  window.__cdnFail = function (name) {
+    var show = function () {
+      var el = document.getElementById('root');
+      if (el && !el.firstChild) {
+        el.innerHTML = '<div style="font-family:sans-serif;max-width:34rem;margin:4rem auto;padding:1.5rem;color:#e8e9ec;background:#16181d;border:1px solid #323845;border-radius:8px"><h2 style="margin-top:0">Couldn\'t load ' + name + '</h2><p>This app loads ' + name + ' from a CDN and it didn\'t arrive — usually a network problem or a blocked connection. Check your connection and refresh the page.</p></div>';
+      }
+    };
+    if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', show); } else { show(); }
+  };
+  // window.storage shim: the app was authored against a host-injected async storage API
+  // (get/set/delete returning promises, get resolving to {value}). In a plain browser no
+  // such API exists, so every persistence path (scenario auto-save, theme, tracker/review
+  // auto-save, changelog badge) was silently inert. Back it with localStorage.
+  if (!window.storage) {
+    window.storage = {
+      get: function (key) {
+        return Promise.resolve().then(function () {
+          var value = localStorage.getItem(key);
+          return value === null ? null : { value: value };
+        });
+      },
+      set: function (key, value) {
+        return Promise.resolve().then(function () { localStorage.setItem(key, String(value)); });
+      },
+      delete: function (key) {
+        return Promise.resolve().then(function () { localStorage.removeItem(key); });
+      }
+    };
+  }
+</script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js" onerror="window.__cdnFail('React')"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" onerror="window.__cdnFail('ReactDOM')"></script>
 <style>
   :root, [data-theme="dark"] {
     --bg: #0e0f12;
@@ -617,6 +651,100 @@ const LAST_SEEN_VERSION_KEY = 'wfm-last-seen-version';
 // `tag` is one of 'feat' (new feature), 'fix' (bug fix), 'change' (behaviour change),
 // 'ui' (visual/interaction tweak). Plain strings default to 'feat'.
 const CHANGELOG = [{
+  version: '0.40.0',
+  date: '2026-07-11',
+  title: 'Simulation correctness and regression coverage',
+  changes: [{
+    tag: 'fix',
+    text: 'Multi-week averaging now balances fractional activity totals across the day instead of independently rounding every half-agent upward. Mixed work/break and work/off weeks retain their true average agent-hours without category-order bias.'
+  }, {
+    tag: 'fix',
+    text: 'Rotation Lab start-band optimization resets coverage for each cycle week, and both fluid and week-block modes now roster every configured contract day or report the hard rule that prevented placement.'
+  }, {
+    tag: 'fix',
+    text: 'Daily-average volume now means the requested average across actual open working days. Per-day desk-hour edits regenerate volume immediately, and fractional expected calls remain fractional through Erlang evaluation instead of becoming artificial low-volume spikes.'
+  }, {
+    tag: 'fix',
+    text: 'Erlang A now interpolates between neighbouring integer server models for fractional effective staffing, removing half-agent service-level jumps. Queue Analytics CSV imports also handle quoted commas and escaped quotes.'
+  }, {
+    tag: 'change',
+    text: 'Added an npm test command and CI regression checks for averaging, Erlang A continuity, quoted CSV, volume conservation, fractional low-volume forecasts, contract-day rotation, and per-week band isolation.'
+  }, {
+    tag: 'fix',
+    text: 'Scenario auto-save failures are no longer swallowed. Storage quota and browser persistence errors now show a visible warning with a prompt to download a safe scenario copy before reloading.'
+  }]
+}, {
+  version: '0.39.0',
+  date: '2026-07-10',
+  title: 'Rotation Lab: start-variance rule (day-to-day drift cap)',
+  changes: [{
+    tag: 'feat',
+    text: 'New rule: min/max start-time variance between consecutive worked days. A 60-minute max means someone starting Monday at 08:00 can start Tuesday anywhere from 07:00 to 09:00 (in band-step increments) — the drift cap unions call fluid rosters humane. It applies across templates (an Early→Late flip on adjacent days counts as drift), across the Sun→Mon week boundary, and resets whenever there\'s a day off in between. The generator enforces it when choosing both people and band offsets, and a final validation pass reports any pair it couldn\'t honour.'
+  }, {
+    tag: 'feat',
+    text: 'Dedicated-pod sizing chips: "Dedicated evening/night pod" answers "if the business hired a group who ONLY work nights, how many people give full-week coverage?" (person-days ÷ work-days per hire, floored by the busiest single night, plus the FTE equivalent), and "Dedicated weekend pod" does the same for weekend-only hires (÷2 — they can only work Sat+Sun). Both use full demand, since a dedicated pod would replace today\'s exempt cover too.'
+  }, {
+    tag: 'change',
+    text: 'Rule interactions surfaced honestly: a tight drift cap plus the everyone-does-evenings rule forces evening work into consecutive blocks rather than scattered days (that\'s the rule doing its job); and a MINIMUM variance can never be satisfied in week-block mode (starts are constant within a week) — reported as a conflict rather than silently ignored.'
+  }]
+}, {
+  version: '0.38.0',
+  date: '2026-07-10',
+  title: 'Rotation Lab: start bands + required-vs-scheduled FTE callout',
+  changes: [{
+    tag: 'feat',
+    text: 'Shift templates now support START BANDS: give a template an earliest and a latest start (e.g. Band 1 starts 07:30–09:30) and the engine chooses each person\'s start time inside the band — greedily filling the intervals where the forecast\'s required-agents curve is still under-covered. Band granularity is configurable (Band step, default 30 min). In week-block mode a person keeps one start time all week; under "days vary, times don\'t" the start locks for the whole cycle. A different start inside the same band counts as churn in the start-time-changes stat, and the burden table now shows each week\'s actual start time.'
+  }, {
+    tag: 'feat',
+    text: 'Required-vs-scheduled FTE callout. A live "Required FTE (forecast)" chip shows what the volume needs before you generate anything; after generating, each week gets a chip comparing scheduled FTE (actual on-queue hours delivered by the pattern, breaks/lunch carved out) against required FTE, plus an "under" figure counting only the intervals where the pattern sits below the required curve — because a pattern can be over on total FTE and still under at the wrong times of day. Hours-per-FTE is configurable (default 40).'
+  }, {
+    tag: 'change',
+    text: '"Apply week N → Agents" now carries each person\'s band start with them, so the applied week matches the simulated one exactly.'
+  }]
+}, {
+  version: '0.37.0',
+  date: '2026-07-10',
+  title: 'Rotation Lab — simulate shift-rotation rule sets',
+  changes: [{
+    tag: 'feat',
+    text: 'New Rotation tab. Define shift templates (start/end, evening tag) with required headcount per day, mark which agents are exempt from the rotation (fixed shift agreements), pick a rule set, and the tool shows live feasibility arithmetic: person-weeks needed vs the rotating pool, slack margin, exemption headroom (how many more fixed agreements before coverage fails), and the fair-share evening/weekend burden per person per cycle.'
+  }, {
+    tag: 'feat',
+    text: 'Rule sets supported: week-block (same start time for the whole week, rotating week to week), fully fluid (any shift any day), and "days vary, times don\'t" (one start time per person for the whole cycle). Plus: minimum evening shifts per cycle, weekend day caps, and no-consecutive-weekends. The generator is seeded (same seed = same roster) and greedily balances evening and weekend burden across the pool.'
+  }, {
+    tag: 'feat',
+    text: 'Generate a full cycle to get: rule violations and coverage shortfalls, per-week service level computed through the same Erlang pipeline as the main simulation (breaks/lunch carved out, exempt agents included, delta vs your current roster), burden summary (evening days, weekend days, start-time changes per person), a per-person burden table, and "Apply week N → Agents" to load any generated week into the main tabs for full heatmap/interval analysis.'
+  }, {
+    tag: 'change',
+    text: 'Rule-set trade-offs the Lab makes visible: "days vary, times don\'t" produces zero start-time churn but pins ALL evening work on the late-template group — the everyone-does-an-evening rule becomes unsatisfiable and is reported as a conflict. Restricting start times (e.g. only 08:00/12:00 templates) shows up directly as SL shape mismatch in the weekly numbers.'
+  }]
+}, {
+  version: '0.36.18',
+  date: '2026-07-10',
+  title: 'Full code review: off-grid shift times, volume rounding, training conflicts, persistence',
+  changes: [{
+    tag: 'fix',
+    text: 'CRITICAL: shift times not on a 15-minute boundary (e.g. 09:10 — common in Verint rosters) produced fractional interval indices, so the agent silently contributed ZERO availability in generated schedules and could never receive individual training. timeToIdx now rounds to the nearest interval, and the importer snaps median shift times to the grid.'
+  }, {
+    tag: 'fix',
+    text: 'Persistence actually works in a plain browser now. The app was authored against a host-injected window.storage API that does not exist on GitHub Pages, so auto-save, theme memory and tracker/review persistence were all silently inert. Added a localStorage-backed shim.'
+  }, {
+    tag: 'fix',
+    text: 'Startup crash-proofing: auto-saved state from an older version is now merged over current defaults on load (same as scenario import), and the whole app is wrapped in the error boundary — a render error no longer produces an unrecoverable blank page. React/ReactDOM CDN failures now show an explanatory message instead of a permanent black screen.'
+  }, {
+    tag: 'fix',
+    text: 'Volume distribution now preserves totals exactly (largest-remainder rounding). Previously per-interval rounding drifted the weekly total (100/week became 105) and rounded small forecasts to zero everywhere (a 70/week forecast produced 0 calls). Closed days\' share of the weekly total is now redistributed across open days for built-in curves, matching shape-pattern behaviour.'
+  }, {
+    tag: 'fix',
+    text: 'Training lever accuracy: (1) full-day training now correctly detects planned-leave conflicts and reports them (it checked field names that never existed, so attendee counts were overstated); (2) cohort mode no longer double-books an agent into two overlapping same-day slots; (3) overnight shifts no longer silently lose a break when training overlaps its anchor — the two calendar-day renders of one shift now share a consistent virtual frame.'
+  }, {
+    tag: 'fix',
+    text: 'erlangC() replaced the factorial series (which overflowed to NaN above ~705 erlangs, making requiredAgents return garbage silently) with the numerically stable Erlang-B recursion. Identical results at normal scale, correct at any scale.'
+  }, {
+    tag: 'fix',
+    text: 'Smaller fixes: default intraday curve no longer places calls after 19:00 (they rendered in the heatmap but were excluded from all metrics since the default desk closes at 19:00); import-success alert no longer prints a literal \\n; CoverageChart tooltip shows "unstable" instead of "Infinity required"; PNG export no longer throws if the canvas yields a null blob.'
+  }]
+}, {
   version: '0.36.17',
   date: '2026-06-11',
   title: 'Midnight-crossing shifts no longer vanish on import; Erlang C fixed for fractional agents',
@@ -1967,7 +2095,10 @@ const idxToTime = i => {
 };
 const timeToIdx = t => {
   const [h, m] = t.split(':').map(Number);
-  return (h * 60 + m) / INTERVAL_MIN;
+  // Round to the nearest interval: off-grid times (e.g. 09:10) would otherwise produce
+  // fractional indices, and grid writes like row[36.67] silently miss the array —
+  // the agent contributed zero availability. Snapping keeps every write on a real cell.
+  return Math.round((h * 60 + m) / INTERVAL_MIN);
 };
 
 // Format a seconds-value into a human-readable string. Small values stay as seconds;
@@ -2867,7 +2998,7 @@ function parseQueueAnalytics(text) {
     }
   }
   if (headerIdx < 0) throw new Error('Could not find Queue Analytics header (expected "Queue Name" + "Volume").');
-  const cols = lines[headerIdx].split(',').map(c => c.trim());
+  const cols = parseVerintCsvRow(lines[headerIdx]).map(c => c.trim());
   const idx = name => cols.findIndex(c => c === name);
 
   // Required columns
@@ -2904,7 +3035,7 @@ function parseQueueAnalytics(text) {
   for (let i = headerIdx + 1; i < lines.length; i++) {
     const raw = (lines[i] || '').trim();
     if (!raw) continue;
-    const parts = raw.split(',');
+    const parts = parseVerintCsvRow(raw);
     const dateStr = (parts[dateCol] || '').trim();
     const dm = dateStr.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
     if (!dm) continue;
@@ -4768,6 +4899,7 @@ function renderHeatmapToPNG(opts) {
   // Always append a generated-on stamp so a printed PNG keeps its provenance
   ctx.fillText('Generated by WFM - What If? · ' + new Date().toISOString().slice(0, 10), padding, legendY + legendLines.length * 14);
   canvas.toBlob(blob => {
+    if (!blob) return; // toBlob may legally yield null (e.g. canvas too large) — don't crash
     triggerDownload(blob, filename + '.png');
   }, 'image/png');
 }
@@ -4904,46 +5036,75 @@ function deriveDayHoursFromGrid(grid) {
 // per-interval per-activity counts, so the synthetic grid flows through them correctly and
 // yields the average-week SLA. Rows beyond an interval's filled activities are 'off'.
 //
-// Rounding note: we round each activity's average independently, which can make an interval's
-// total drift by ±1 from the true mean. We cap total rows at the max headcount seen so the
-// synthetic grid never claims more bodies than any real week had.
+// A categorical grid cannot store half an agent in one cell. To avoid systematically rounding
+// every 0.5 upward, we use cumulative deficit balancing across the day: each interval assigns
+// the available synthetic rows to the activities furthest below their exact cumulative average.
+// This preserves each category's total agent-intervals to within one cell while keeping every
+// interval's headcount internally consistent. In particular, 0.5 work across a day alternates
+// between work/off instead of becoming a full agent in every interval.
 function averageGrids(grids) {
   const valid = (grids || []).filter(g => Array.isArray(g) && g.length === 7);
   if (valid.length === 0) return null;
   if (valid.length === 1) return valid[0].map(day => day.map(row => row.slice()));
   const n = valid.length;
-  // The activity codes we track. 'off' is implicit (the leftover rows).
-  const CODES = ['work', 'break', 'lunch', 'train', 'admin', 'downtime', 'leave_p', 'leave_u'];
+  // Include off explicitly in the balancing pass. Missing rows in a smaller source week count
+  // as off so every source contributes exactly maxAgents bodies to every interval.
+  const CODES = ['work', 'break', 'lunch', 'train', 'admin', 'downtime', 'leave_p', 'leave_u', 'off'];
   // Max headcount across all weeks/days → number of rows in the synthetic grid.
   let maxAgents = 0;
   for (const g of valid) for (let d = 0; d < 7; d++) maxAgents = Math.max(maxAgents, g[d].length);
   const out = [];
   for (let d = 0; d < 7; d++) {
-    // For each interval, tally counts per activity across weeks, then average+round.
-    // avgCounts[i] = { work: x, break: y, ... }
+    // For each interval, tally exact fractional averages per activity.
     const avgCounts = [];
     for (let i = 0; i < INTERVALS_PER_DAY; i++) {
       const sum = {};
       for (const c of CODES) sum[c] = 0;
       for (const g of valid) {
         const dayRows = g[d] || [];
-        for (let a = 0; a < dayRows.length; a++) {
-          const cell = dayRows[a] && dayRows[a][i];
-          if (cell && sum[cell] !== undefined) sum[cell]++;
+        for (let a = 0; a < maxAgents; a++) {
+          const cell = dayRows[a] && dayRows[a][i] || 'off';
+          if (sum[cell] !== undefined) sum[cell]++;else sum.off++;
         }
       }
       const avg = {};
-      for (const c of CODES) avg[c] = Math.round(sum[c] / n);
+      for (const c of CODES) avg[c] = sum[c] / n;
       avgCounts.push(avg);
     }
-    // Synthesise rows: fill column-by-column. For each interval, lay down the averaged number
-    // of each activity into successive rows. We allocate maxAgents rows of all-'off' then write.
+    // Convert fractional averages to categorical cells without category-order bias. At every
+    // interval, allocate maxAgents rows to the categories with the largest cumulative deficit.
+    const cumulativeTarget = {};
+    const cumulativeAssigned = {};
+    for (const c of CODES) cumulativeTarget[c] = cumulativeAssigned[c] = 0;
+    const balancedCounts = [];
+    for (let i = 0; i < INTERVALS_PER_DAY; i++) {
+      for (const c of CODES) cumulativeTarget[c] += avgCounts[i][c];
+      const counts = {};
+      for (const c of CODES) counts[c] = 0;
+      for (let row = 0; row < maxAgents; row++) {
+        let best = CODES[0];
+        let bestDeficit = -Infinity;
+        // Rotate exact ties by interval so no activity wins forever merely because of order.
+        for (let k = 0; k < CODES.length; k++) {
+          const c = CODES[(k + i + d) % CODES.length];
+          const deficit = cumulativeTarget[c] - cumulativeAssigned[c] - counts[c];
+          if (deficit > bestDeficit + 1e-12) {
+            bestDeficit = deficit;
+            best = c;
+          }
+        }
+        counts[best]++;
+      }
+      for (const c of CODES) cumulativeAssigned[c] += counts[c];
+      balancedCounts.push(counts);
+    }
+    // Synthesise rows column-by-column from the balanced integer counts.
     const dayRows = [];
     for (let a = 0; a < maxAgents; a++) dayRows.push(new Array(INTERVALS_PER_DAY).fill('off'));
     for (let i = 0; i < INTERVALS_PER_DAY; i++) {
       let row = 0;
       for (const c of CODES) {
-        const count = avgCounts[i][c];
+        const count = balancedCounts[i][c];
         for (let k = 0; k < count && row < maxAgents; k++, row++) {
           dayRows[row][i] = c;
         }
@@ -5051,15 +5212,15 @@ function erlangC(agents, traffic) {
   if (agents <= 0) return 1;
   if (traffic <= 0) return 0;
   if (traffic >= agents) return 1;
-  let sum = 0;
-  let term = 1;
-  for (let k = 0; k < agents; k++) {
-    if (k > 0) term = term * traffic / k;
-    sum += term;
+  // Erlang-B recursion, then convert to Erlang C. The old direct series (sum of
+  // traffic^k/k!) peaked at ~e^traffic and overflowed to NaN above ~705 erlangs —
+  // requiredAgents then silently returned garbage. The recursion is numerically
+  // stable at any realistic scale: B_k = A·B_{k-1} / (k + A·B_{k-1}).
+  let b = 1;
+  for (let k = 1; k <= agents; k++) {
+    b = traffic * b / (k + traffic * b);
   }
-  const topTerm = term * traffic / agents;
-  const denom = topTerm * (agents / (agents - traffic)) + sum;
-  const pw = topTerm * (agents / (agents - traffic)) / denom;
+  const pw = agents * b / (agents - traffic * (1 - b));
   return Math.max(0, Math.min(1, pw));
 }
 function serviceLevel(agents, callsPerInterval, ahtSec, slTargetSec, intervalSec) {
@@ -5155,6 +5316,22 @@ function erlangA(agents, callsPerInterval, ahtSec, patienceSec, slTargetSec, int
       abandoned: 0
     });
   }
+  // Shrinkage can produce fractional effective staffing. Erlang A is defined for integer
+  // server counts, so evaluate the neighbouring integer systems and interpolate the complete
+  // result. Rounding to the nearest integer created large SL jumps at every half-agent.
+  if (!Number.isInteger(agents) && agents > 0) {
+    const nLo = Math.floor(agents);
+    const nHi = Math.ceil(agents);
+    const lo = erlangA(nLo, callsPerInterval, ahtSec, patienceSec, slTargetSec, intervalSec);
+    const hi = erlangA(nHi, callsPerInterval, ahtSec, patienceSec, slTargetSec, intervalSec);
+    const f = agents - nLo;
+    const out = {};
+    for (const key of ['sl', 'asa', 'occ', 'pw', 'pAbandon', 'abandoned', 'traffic']) {
+      out[key] = lo[key] + f * (hi[key] - lo[key]);
+    }
+    out.unstable = out.traffic >= agents;
+    return out;
+  }
   const lambda = callsPerInterval / intervalSec;
   const mu = 1 / ahtSec;
   const theta = 1 / patienceSec;
@@ -5172,12 +5349,8 @@ function erlangA(agents, callsPerInterval, ahtSec, patienceSec, slTargetSec, int
     };
   }
 
-  // The Erlang A stationary distribution is defined on integer states (k = number of calls
-  // in the system). When the caller passes a fractional agent count — e.g. after applying a
-  // downtime shrinkage factor — the boundary condition `k <= N` becomes ambiguous and the
-  // birth-death recursion produces NaN. Round N to the nearest integer. The lost precision
-  // (max 0.5 agents) is well within model-vs-reality noise.
-  const N = Math.max(1, Math.round(agents));
+  // Fractional counts have already been handled above, so this is an exact integer boundary.
+  const N = Math.max(1, agents);
   const maxQ = Math.max(200, Math.ceil(traffic * 3 + N * 2));
 
   // log-space unnormalized stationary probabilities
@@ -5293,7 +5466,10 @@ const defaultIntradayCurve = (() => {
   for (let i = 0; i < INTERVALS_PER_DAY; i++) {
     const h = i * INTERVAL_MIN / 60;
     let v = 0;
-    if (h < 7) v = 0;else if (h < 8) v = (h - 7) * 4;else if (h < 10) v = 4 + (h - 8) * 4;else if (h < 11.5) v = 12 - Math.abs(h - 10.5) * 2;else if (h < 13) v = 10 - (h - 11.5) * 2;else if (h < 14.5) v = 7 + (h - 13);else if (h < 16) v = 9 - (h - 14.5) * 1.5;else if (h < 18) v = 6 - (h - 16) * 2;else if (h < 20) v = 2 - (h - 18) * 0.8;else v = 0;
+    // Tail cut at 19:00 (not 20:00): the default desk hours are 07:00-19:00, and volume
+    // outside open hours renders in the heatmap but is silently excluded from every
+    // daily/weekly metric — the default scenario shipped ~1%/day of invisible calls.
+    if (h < 7) v = 0;else if (h < 8) v = (h - 7) * 4;else if (h < 10) v = 4 + (h - 8) * 4;else if (h < 11.5) v = 12 - Math.abs(h - 10.5) * 2;else if (h < 13) v = 10 - (h - 11.5) * 2;else if (h < 14.5) v = 7 + (h - 13);else if (h < 16) v = 9 - (h - 14.5) * 1.5;else if (h < 18) v = 6 - (h - 16) * 2;else if (h < 19) v = 2 - (h - 18) * 0.8;else v = 0;
     curve[i] = Math.max(0, v);
   }
   return curve;
@@ -5304,7 +5480,7 @@ function makeDefaultVolume() {
   const grid = [];
   const sum = defaultIntradayCurve.reduce((a, b) => a + b, 0);
   for (let d = 0; d < 7; d++) {
-    const row = defaultIntradayCurve.map(v => Math.round(v / sum * totalDailyCalls * dayMultipliers[d]));
+    const row = defaultIntradayCurve.map(v => v / sum * totalDailyCalls * dayMultipliers[d]);
     grid.push(row);
   }
   return grid;
@@ -5457,6 +5633,62 @@ const DEFAULT_STATE = {
     scheduleView: {
       day: 0
     }
+  },
+  // Rotation Lab — simulate shift-rotation rule sets: who rotates, what shift templates
+  // exist, how much cover each template needs per day, and which fairness/stability rules
+  // apply. The generator produces a cycle-long roster, burden stats, and SL per week.
+  rotation: {
+    cycleWeeks: 4,
+    workDaysPerWeek: 5,
+    seed: 1,
+    // Start-band granularity: when a template has a start band (bandLatest > start), the
+    // engine picks each person's start time inside the band in steps of this many minutes.
+    bandStepMin: 30,
+    // Hours that count as one FTE-week, for the required-vs-scheduled FTE callout.
+    fteWeeklyHours: 40,
+    // Shift templates the rotation can use. `evening` tags templates that count toward
+    // the evening-shift fairness rule. `start` is the EARLIEST start; `bandLatest` (if
+    // later than start) makes it a start band — the engine chooses each person's start
+    // inside [start, bandLatest] to best fill the forecast's required-agents curve.
+    // `end` is the shift end when starting at `start` (i.e. it defines shift LENGTH;
+    // a later start inside the band shifts the end correspondingly).
+    templates: [{
+      id: 'T1',
+      name: 'Early',
+      start: '07:30',
+      bandLatest: '09:30',
+      end: '15:30',
+      evening: false,
+      // Required headcount on this template, Mon..Sun
+      demand: [20, 20, 20, 20, 20, 8, 5]
+    }, {
+      id: 'T2',
+      name: 'Late',
+      start: '12:00',
+      bandLatest: '12:00',
+      end: '20:00',
+      evening: true,
+      demand: [10, 10, 10, 10, 10, 4, 3]
+    }],
+    rules: {
+      // 'weekBlock' = same start time for the whole week (rotate week-by-week).
+      // 'daily' = fluid: any template any day (current behaviour, most flexible).
+      mode: 'weekBlock',
+      // Week-block only: keep the SAME template across the whole cycle (days vary, times
+      // don't). Maximum stability — concentrates evening burden on the late-template group.
+      fixedTemplateAcrossCycle: false,
+      // Everyone must work at least this many evening SHIFTS (days) per cycle. 0 = off.
+      minEveningShiftsPerCycle: 1,
+      // Cap on weekend days per person per cycle. 0 = auto (fair share, no cap).
+      maxWeekendDaysPerCycle: 0,
+      // Never roster the same person on two consecutive weekends.
+      noConsecutiveWeekends: false,
+      // Start-time variance between CONSECUTIVE worked days, in minutes. Max = drift cap
+      // (Monday 08:00 with a 60-min cap means Tuesday starts 07:00-09:00); min = forced
+      // rotation (rarely used). A day off in between resets the constraint. 0 = off.
+      minStartVarianceMin: 0,
+      maxStartVarianceMin: 0
+    }
   }
 };
 async function loadState() {
@@ -5469,11 +5701,9 @@ async function loadState() {
   return null;
 }
 async function saveState(s) {
-  try {
-    if (window.storage && window.storage.set) {
-      await window.storage.set(STORAGE_KEY, JSON.stringify(s));
-    }
-  } catch (e) {}
+  if (window.storage && window.storage.set) {
+    await window.storage.set(STORAGE_KEY, JSON.stringify(s));
+  }
 }
 
 // Schedule activity codes: 'off', 'work', 'break', 'lunch', 'train'
@@ -5504,7 +5734,7 @@ function placeBreakIntervals(row, shiftStart, shiftEnd, breakLen, idealAnchor, l
   }
   return false;
 }
-function buildScheduleForAgent(state, agent, day, trainingPlacements) {
+function buildScheduleForAgent(state, agent, day, trainingPlacements, allPlacementsByDay) {
   // Returns a row of 96 intervals for one agent on one day.
   //
   // Conceptual model: an agent has zero or more LOGICAL SHIFTS in a week. Each shift starts
@@ -5684,21 +5914,43 @@ function buildScheduleForAgent(state, agent, day, trainingPlacements) {
 
   // Step 3: for EACH shift contributing to this day, place breaks/lunch in that shift's
   //         virtual frame and write the cells that fall on this day.
+  //
+  // CONSISTENCY REQUIREMENT: an overnight shift is rendered twice (origin day + wrap day),
+  // and each render independently re-derives the SAME break decisions. Both renders must
+  // therefore see an identical virtual frame. Previously, off-day cells were blindly
+  // assumed to be 'work', so when training occupied a break's anchor region the two renders
+  // disagreed — each "placed" the break on the other day's territory and neither committed
+  // it (a break silently vanished, with no displacement report). Fix: build an explicit
+  // virtual occupancy array that mirrors the adjacent day's desk-hours clip and training
+  // placements, and mark placed blocks in it so sequential placements stay consistent too.
   for (const sh of shifts) {
     // Map a virtual position (0..shiftLen) to its absolute index in 96-cell day coordinates.
     // If the result is outside [0, INTERVALS_PER_DAY) it lands on another calendar day (which
     // will handle it during ITS render).
     const vToAbs = vPos => sh.startAbs + vPos;
 
-    // Is a virtual position currently a 'work' cell on THIS day's row?
-    // If the virtual position maps to a cell outside today, we assume 'work' (the OTHER day's
-    // render will determine the actual status; this is just for break-placement search).
-    const isVirtualWork = vPos => {
+    // Would this virtual position read as a free 'work' cell in whichever day's render
+    // owns it? Own-day cells read the actual row; off-day cells replicate what the other
+    // day's render computes in its Steps 1-2 (desk clip + non-full-day training).
+    const virtualFree = vPos => {
       if (vPos < 0 || vPos >= shiftLen) return false;
       const abs = vToAbs(vPos);
-      if (abs < 0 || abs >= INTERVALS_PER_DAY) return true; // off-day, assume work
-      return row[abs] === 'work';
+      if (abs >= 0 && abs < INTERVALS_PER_DAY) return row[abs] === 'work';
+      const otherDay = abs < 0 ? sh.originDay : (day + 1) % 7;
+      const otherAbs = abs < 0 ? abs + INTERVALS_PER_DAY : abs - INTERVALS_PER_DAY;
+      if (isDayClosed(config, otherDay)) return false;
+      if (otherAbs < getDayStartIdx(config, otherDay) || otherAbs >= getDayEndIdx(config, otherDay)) return false;
+      const otherTps = allPlacementsByDay && allPlacementsByDay[otherDay] || [];
+      for (const tp of otherTps) {
+        if (tp.fullDay) continue; // applied after breaks; preserves them
+        if (otherAbs >= tp.start && otherAbs < tp.start + tp.durIntervals) return false;
+      }
+      return true;
     };
+    // Virtual occupancy for THIS shift's frame — the placement search runs against this,
+    // so a block placed on off-day territory still occupies the frame for later blocks.
+    const virt = new Array(shiftLen);
+    for (let v = 0; v < shiftLen; v++) virt[v] = virtualFree(v);
 
     // Write a virtual position with a label only if it falls on this calendar day.
     const writeVirtual = (vPos, label) => {
@@ -5711,7 +5963,7 @@ function buildScheduleForAgent(state, agent, day, trainingPlacements) {
     const findVirtualSlot = (anchor, len) => {
       const tryAt = start => {
         if (start < 0 || start + len > shiftLen) return false;
-        for (let k = 0; k < len; k++) if (!isVirtualWork(start + k)) return false;
+        for (let k = 0; k < len; k++) if (!virt[start + k]) return false;
         return true;
       };
       if (tryAt(anchor)) return anchor;
@@ -5734,7 +5986,10 @@ function buildScheduleForAgent(state, agent, day, trainingPlacements) {
         });
         return;
       }
-      for (let k = 0; k < len; k++) writeVirtual(slot + k, label);
+      for (let k = 0; k < len; k++) {
+        virt[slot + k] = false; // occupy the frame so later blocks can't reuse it
+        writeVirtual(slot + k, label);
+      }
     };
     if (config.includeBreaks && config.breakMin > 0) {
       const breakLen = Math.max(1, Math.round(config.breakMin / INTERVAL_MIN));
@@ -6226,7 +6481,10 @@ function planTrainingPlacements(state, eligibilityOverride) {
             // Generated path: rejected only if agent has planned leave that overlaps today.
             // Agents not normally rostered today get drafted in — buildScheduleForAgent will
             // synthesise their shift around the training cells.
-            const hasPlannedLeave = (state.plannedLeave || []).some(pl => pl.agentId === agent.id && (pl.dayOfWeek === day || pl.days && pl.days.includes(day)));
+            // plannedLeave entries are {agentId, day} — earlier code checked pl.dayOfWeek /
+            // pl.days (fields that never exist), so leave conflicts were never detected and
+            // full-day training over-reported attendees.
+            const hasPlannedLeave = (state.plannedLeave || []).some(pl => pl.agentId === agent.id && pl.day === day);
             canAttend = !hasPlannedLeave;
           }
           if (canAttend) {
@@ -6390,15 +6648,27 @@ function planTrainingPlacements(state, eligibilityOverride) {
         const picks = [];
         const available = eligible.slice();
         for (let n = 0; n < attendCount; n++) {
-          if (available.length === 0) break;
-          // Sort available by current load ASC (lightest first), preferring slots below max
-          available.sort((s1, s2) => {
+          // Exclude slots that overlap one this agent was already given this session —
+          // eligibility was computed before any picks were made, so without this check
+          // an agent could be double-booked into two overlapping same-day slots.
+          const usable = available.filter(sIdx => !picks.some(p => {
+            const a = slots[p];
+            const b = slots[sIdx];
+            if (a.day !== b.day) return false;
+            const aS = timeToIdx(a.startTime);
+            const bS = timeToIdx(b.startTime);
+            return bS < aS + durIntervals && aS < bS + durIntervals;
+          }));
+          if (usable.length === 0) break;
+          // Sort usable by current load ASC (lightest first), preferring slots below max
+          usable.sort((s1, s2) => {
             const room1 = slotLoad[s1] < maxPerSlot ? 0 : 1;
             const room2 = slotLoad[s2] < maxPerSlot ? 0 : 1;
             if (room1 !== room2) return room1 - room2; // prefer under-max
             return slotLoad[s1] - slotLoad[s2]; // then lightest
           });
-          const chosen = available.shift();
+          const chosen = usable[0];
+          available.splice(available.indexOf(chosen), 1);
           picks.push(chosen);
           slotLoad[chosen]++;
         }
@@ -7248,7 +7518,7 @@ function buildFullSchedule(state) {
       const {
         row,
         displaced
-      } = buildScheduleForAgent(state, agents[a], d, tps);
+      } = buildScheduleForAgent(state, agents[a], d, tps, plan.placements[a] || {});
       dayGrid.push(row);
       if (displaced.length > 0) {
         for (const dp of displaced) {
@@ -7303,12 +7573,756 @@ function computePlannedAvailability(state, plan) {
       // Build the row IGNORING leave - this is the "as-planned" view
       const {
         row
-      } = buildScheduleForAgent(state, agent, d, tps);
+      } = buildScheduleForAgent(state, agent, d, tps, plan.placements[a] || {});
       for (let i = 0; i < INTERVALS_PER_DAY; i++) {
         if (row[i] === 'work') dayRow[i]++;
       }
     }
     out.push(dayRow);
+  }
+  return out;
+}
+
+// =============================================================================
+// ROTATION LAB ENGINE
+// =============================================================================
+// Simulates shift-rotation rule sets. Terminology:
+//   - template: a shift shape (start/end time), optionally tagged `evening`.
+//   - demand: required headcount per template per day-of-week.
+//   - rotators: agents participating in the rotation; exempt agents keep their
+//     fixed shift and are subtracted from demand where their shift matches a template.
+//   - cycle: the repeating horizon (e.g. 4 weeks). Fairness is measured per cycle.
+// The generator is greedy with fairness-counter ranking + seeded tie-breaks: at
+// service-desk scale that lands within a shift or two of optimal, and determinism
+// (same seed → same roster) matters more than squeezing the last swap.
+
+function rotationConfig(state) {
+  const def = DEFAULT_STATE.rotation;
+  const r = state.rotation || {};
+  return {
+    cycleWeeks: Math.max(1, Math.min(12, r.cycleWeeks || def.cycleWeeks)),
+    workDaysPerWeek: Math.max(1, Math.min(7, r.workDaysPerWeek || def.workDaysPerWeek)),
+    seed: r.seed || 1,
+    bandStepMin: Math.max(INTERVAL_MIN, Math.round((r.bandStepMin || def.bandStepMin || 30) / INTERVAL_MIN) * INTERVAL_MIN),
+    fteWeeklyHours: Math.max(1, r.fteWeeklyHours || def.fteWeeklyHours || 40),
+    templates: (r.templates && r.templates.length ? r.templates : def.templates).map(t => Object.assign({}, t, {
+      demand: (t.demand || []).slice(0, 7).concat(new Array(Math.max(0, 7 - (t.demand || []).length)).fill(0)),
+      // A band's latest start can't be before its earliest start
+      bandLatest: t.bandLatest && timeToIdx(t.bandLatest) > timeToIdx(t.start) ? t.bandLatest : t.start
+    })),
+    rules: Object.assign({}, def.rules, r.rules || {})
+  };
+}
+
+// Required agents per interval from the current forecast — the curve start-band offsets
+// optimise against, and the basis of the required-FTE callout.
+function rotationRequiredGrid(state) {
+  const req = [];
+  for (let d = 0; d < 7; d++) {
+    const row = new Array(INTERVALS_PER_DAY).fill(0);
+    if (!isDayClosed(state.config, d)) {
+      const s = getDayStartIdx(state.config, d),
+        e = getDayEndIdx(state.config, d);
+      for (let i = s; i < e; i++) {
+        const calls = (state.volume[d] || [])[i] || 0;
+        if (calls > 0) row[i] = requiredAgents(calls, state.config);
+      }
+    }
+    req.push(row);
+  }
+  return req;
+}
+function rotationRotators(state) {
+  return (state.agents || []).filter(a => !a.rotationExempt);
+}
+
+// Exempt coverage: an exempt agent whose fixed shift START matches a template's start
+// counts toward that template's demand on the days they work. Non-matching exempt
+// shifts still contribute to SL (they're in the roster) but not to the template math.
+function rotationResidualDemand(state, cfg) {
+  const residual = cfg.templates.map(t => t.demand.slice());
+  const unmatchedExempt = [];
+  for (const a of state.agents || []) {
+    if (!a.rotationExempt) continue;
+    // Match if the exempt agent's fixed start falls anywhere inside the template's
+    // start band (for fixed-start templates the band collapses to one time).
+    const aIdx = timeToIdx(a.shiftStart);
+    const tIdx = cfg.templates.findIndex(t => aIdx >= timeToIdx(t.start) && aIdx <= timeToIdx(t.bandLatest || t.start));
+    if (tIdx < 0) {
+      unmatchedExempt.push(a.name);
+      continue;
+    }
+    for (const d of a.workDays || []) {
+      if (residual[tIdx][d] > 0) residual[tIdx][d]--;
+    }
+  }
+  return {
+    residual,
+    unmatchedExempt
+  };
+}
+
+// Pure arithmetic feasibility — no roster needed. Returns the numbers that decide
+// whether a rule set can work at all, and how much slack it has.
+function rotationFeasibility(state) {
+  const cfg = rotationConfig(state);
+  const rotators = rotationRotators(state);
+  const {
+    residual,
+    unmatchedExempt
+  } = rotationResidualDemand(state, cfg);
+  const nT = cfg.templates.length;
+  const wd = cfg.workDaysPerWeek;
+  // Per-template person-week needs (week-block): the group on template t must be big
+  // enough that (a) its total person-days cover the week's demand and (b) it has enough
+  // bodies on the single busiest day.
+  const perTemplate = [];
+  let personWeeksNeeded = 0;
+  let personDaysNeeded = 0;
+  let maxDailyNeed = 0;
+  for (let t = 0; t < nT; t++) {
+    const days = residual[t];
+    const pd = days.reduce((a, b) => a + b, 0);
+    const peak = Math.max.apply(null, days.concat([0]));
+    const pw = Math.max(Math.ceil(pd / wd), peak);
+    perTemplate.push({
+      template: cfg.templates[t],
+      personDays: pd,
+      peakDay: peak,
+      personWeeks: pw
+    });
+    personWeeksNeeded += pw;
+    personDaysNeeded += pd;
+  }
+  for (let d = 0; d < 7; d++) {
+    let dayNeed = 0;
+    for (let t = 0; t < nT; t++) dayNeed += residual[t][d];
+    maxDailyNeed = Math.max(maxDailyNeed, dayNeed);
+  }
+  const n = rotators.length;
+  const capacityDays = n * wd;
+  // Slack under each mode. Week-block quantises to whole person-weeks; daily mode only
+  // needs raw person-days plus enough bodies on the busiest day.
+  const weekBlockMargin = n - personWeeksNeeded;
+  const dailyMargin = Math.floor((capacityDays - personDaysNeeded) / wd);
+  const margin = cfg.rules.mode === 'weekBlock' ? weekBlockMargin : Math.min(dailyMargin, n - maxDailyNeed);
+  // Weekend + evening burden per person per cycle (the fairness arithmetic the
+  // business asks about).
+  let weekendDays = 0,
+    eveningDays = 0;
+  for (let t = 0; t < nT; t++) {
+    weekendDays += residual[t][5] + residual[t][6];
+    if (cfg.templates[t].evening) eveningDays += residual[t].reduce((a, b) => a + b, 0);
+  }
+  // Dedicated-pod sizing: "if the business hired a group who ONLY work evenings/nights
+  // (or only weekends), how many people give full-week coverage?" Uses FULL demand, not
+  // residual — a dedicated pod would replace today's exempt cover too. Headcount is
+  // person-days ÷ days each hire works, floored by the busiest single day (you can't
+  // cover a 5-person night with 4 people no matter how the week averages out).
+  const evePeakByDay = new Array(7).fill(0);
+  let evePd = 0,
+    eveHours = 0,
+    wkndPd = 0,
+    wkndHours = 0;
+  const wkndByDay = [0, 0];
+  for (let t = 0; t < nT; t++) {
+    const dem = cfg.templates[t].demand;
+    const eIdx = cfg.templates[t].end === '00:00' ? INTERVALS_PER_DAY : timeToIdx(cfg.templates[t].end);
+    const lenH = Math.max(0, eIdx - timeToIdx(cfg.templates[t].start)) * INTERVAL_MIN / 60;
+    if (cfg.templates[t].evening) {
+      for (let d = 0; d < 7; d++) {
+        evePd += dem[d];
+        evePeakByDay[d] += dem[d];
+        eveHours += dem[d] * lenH;
+      }
+    }
+    wkndPd += dem[5] + dem[6];
+    wkndByDay[0] += dem[5];
+    wkndByDay[1] += dem[6];
+    wkndHours += (dem[5] + dem[6]) * lenH;
+  }
+  const evePeak = Math.max.apply(null, evePeakByDay);
+  const fteH = cfg.fteWeeklyHours || 40;
+  const eveningPod = {
+    personDays: evePd,
+    people: evePd > 0 ? Math.max(Math.ceil(evePd / wd), evePeak) : 0,
+    fte: eveHours / fteH
+  };
+  const weekendPod = {
+    personDays: wkndPd,
+    // Weekend-only hires can work at most the 2 weekend days each week
+    people: wkndPd > 0 ? Math.max(Math.ceil(wkndPd / 2), Math.max(wkndByDay[0], wkndByDay[1])) : 0,
+    fte: wkndHours / fteH
+  };
+  return {
+    eveningPod,
+    weekendPod,
+    cfg,
+    rotatorCount: n,
+    perTemplate,
+    personWeeksNeeded,
+    personDaysNeeded,
+    capacityDays,
+    maxDailyNeed,
+    weekBlockMargin,
+    dailyMargin,
+    margin,
+    feasible: margin >= 0,
+    // How many more exemptions/leavers before this rule set stops covering demand.
+    exemptionHeadroom: Math.max(0, margin),
+    weekendDaysPerWeek: weekendDays,
+    weekendPerPersonPerCycle: n > 0 ? weekendDays * cfg.cycleWeeks / n : 0,
+    eveningPerPersonPerCycle: n > 0 ? eveningDays * cfg.cycleWeeks / n : 0,
+    unmatchedExempt
+  };
+}
+
+// Generate a full cycle roster. Returns:
+//   weeks: [{ byAgent: { agentId: [templateIdx|-1 × 7] } }]   (rotators only)
+//   burden: { agentId: { eveningDays, weekendDays, templateCounts, weekChanges } }
+//   violations: [str]
+//   feas: rotationFeasibility result
+function generateRotation(state) {
+  const feas = rotationFeasibility(state);
+  const cfg = feas.cfg;
+  const rules = cfg.rules;
+  const rotators = rotationRotators(state);
+  const {
+    residual
+  } = rotationResidualDemand(state, cfg);
+  const nT = cfg.templates.length;
+  const wd = cfg.workDaysPerWeek;
+  const violations = [];
+  // Informational notes — not rule breaches, kept separate so a clean roster reads clean.
+  const notes = [];
+  if (feas.unmatchedExempt.length) {
+    notes.push('Exempt shifts not matching any template (counted in SL but not in demand): ' + feas.unmatchedExempt.join(', '));
+  }
+  for (const t of cfg.templates) {
+    if (t.end !== '00:00' && timeToIdx(t.end) <= timeToIdx(t.start)) {
+      violations.push('Template "' + t.name + '" crosses midnight — not supported in the Rotation Lab; its post-midnight cover will be undercounted.');
+    }
+  }
+  const burden = {};
+  for (const a of rotators) burden[a.id] = {
+    eveningDays: 0,
+    weekendDays: 0,
+    templateCounts: new Array(nT).fill(0),
+    weekChanges: 0,
+    lastWeekTemplate: -1,
+    // Start-time identity of last week (template*1000 + band offset) for churn counting,
+    // and the cycle-locked band offset under "days vary, times don't".
+    lastWeekKey: -1,
+    lockedOffset: null,
+    workedWeekendLastWeek: false,
+    // Start index of last week's Sunday shift (null if not worked) — the cross-week
+    // half of the consecutive-day start-variance rule.
+    prevWeekSunStart: null
+  };
+  const weeks = [];
+  const rng = seededRandom(cfg.seed * 7919 + 13);
+  const jitter = () => rng();
+
+  // ---- Start-band machinery ----
+  // Offsets are chosen greedily against the forecast's required-agents curve: each
+  // person is started where their shift fills the most currently-under-covered
+  // intervals. Coverage accumulates as assignments are made (exempt agents first,
+  // full-shift approximation — the SL sim carves breaks properly later).
+  const reqGrid = rotationRequiredGrid(state);
+  const exemptCov = [];
+  for (let d = 0; d < 7; d++) exemptCov.push(new Array(INTERVALS_PER_DAY).fill(0));
+  for (const a of state.agents || []) {
+    if (!a.rotationExempt) continue;
+    for (let d = 0; d < 7; d++) {
+      for (const seg of getAgentWorkingIntervals(a, d)) {
+        for (let i = seg.start; i < seg.end; i++) exemptCov[d][i]++;
+      }
+    }
+  }
+  // Reassigned at the start of every generated week. Weeks are alternative points in a
+  // repeating cycle, not simultaneous layers of coverage.
+  let cov = exemptCov.map(row => row.slice());
+  const tplStartIdx = cfg.templates.map(t => timeToIdx(t.start));
+  const tplLen = cfg.templates.map(t => {
+    const e = t.end === '00:00' ? INTERVALS_PER_DAY : timeToIdx(t.end);
+    return Math.max(1, e - timeToIdx(t.start));
+  });
+  const tplOffsets = cfg.templates.map((t, ti) => {
+    const latest = timeToIdx(t.bandLatest || t.start);
+    const step = Math.max(1, Math.round(cfg.bandStepMin / INTERVAL_MIN));
+    const list = [];
+    for (let o = 0; tplStartIdx[ti] + o <= latest; o += step) list.push(o);
+    return list.length ? list : [0];
+  });
+  const addCov = (d, t, o, delta) => {
+    const s = tplStartIdx[t] + o;
+    const e = Math.min(INTERVALS_PER_DAY, s + tplLen[t]);
+    for (let i = s; i < e; i++) cov[d][i] += delta;
+  };
+  // How many under-covered person-intervals would a shift at this offset fill, summed
+  // over the given days?
+  const offsetGain = (days, t, o) => {
+    const s = tplStartIdx[t] + o;
+    const e = Math.min(INTERVALS_PER_DAY, s + tplLen[t]);
+    let gain = 0;
+    for (const d of days) {
+      for (let i = s; i < e; i++) {
+        if (cov[d][i] < reqGrid[d][i]) gain++;
+      }
+    }
+    return gain;
+  };
+  const pickOffset = (days, t, locked, optsOverride) => {
+    if (locked != null) return locked;
+    const opts = optsOverride && optsOverride.length ? optsOverride : tplOffsets[t];
+    if (opts.length === 1) return opts[0];
+    let best = opts[0],
+      bestGain = -1;
+    for (const o of opts) {
+      const g2 = offsetGain(days, t, o);
+      if (g2 > bestGain) {
+        bestGain = g2;
+        best = o;
+      }
+    }
+    return best;
+  };
+
+  // ---- Start-variance rule (min/max drift between consecutive worked days) ----
+  const varianceActive = rules.minStartVarianceMin > 0 || rules.maxStartVarianceMin > 0;
+  const startVarOK = (sIdx, neighborSIdx) => {
+    if (neighborSIdx == null) return true;
+    const diff = Math.abs(sIdx - neighborSIdx) * INTERVAL_MIN;
+    if (rules.maxStartVarianceMin > 0 && diff > rules.maxStartVarianceMin) return false;
+    if (rules.minStartVarianceMin > 0 && diff < rules.minStartVarianceMin) return false;
+    return true;
+  };
+
+  for (let w = 0; w < cfg.cycleWeeks; w++) {
+    cov = exemptCov.map(row => row.slice());
+    const byAgent = {};
+    const offsetByAgent = {};
+    for (const a of rotators) {
+      byAgent[a.id] = new Array(7).fill(-1);
+      offsetByAgent[a.id] = new Array(7).fill(0);
+    }
+    const weekendWorkedThisWeek = new Set();
+    // Starts already assigned on adjacent worked days (for the start-variance rule):
+    // the day before and after within this week, plus last week's Sunday when d = Monday.
+    const neighborStarts = (aId, d) => {
+      const list = [];
+      if (d === 0 && burden[aId].prevWeekSunStart != null) list.push(burden[aId].prevWeekSunStart);
+      for (const nd of [d - 1, d + 1]) {
+        if (nd < 0 || nd > 6) continue;
+        const nt = byAgent[aId][nd];
+        if (nt !== -1) list.push(tplStartIdx[nt] + (offsetByAgent[aId][nd] || 0));
+      }
+      return list;
+    };
+
+    if (rules.mode === 'weekBlock') {
+      // ---- Phase 1: assign each rotator-week to ONE template ----
+      const groupSizes = feas.perTemplate.map(pt => pt.personWeeks);
+      let sizeSum = groupSizes.reduce((a, b) => a + b, 0);
+      if (sizeSum > rotators.length) {
+        violations.push('Week ' + (w + 1) + ': demand needs ' + sizeSum + ' person-weeks but only ' + rotators.length + ' rotators — coverage will fall short.');
+      }
+      // Spare rotators join the largest-demand template (extra cover, keeps them rostered)
+      const spare = Math.max(0, rotators.length - sizeSum);
+      if (spare > 0 && nT > 0) {
+        let big = 0;
+        for (let t = 1; t < nT; t++) if (feas.perTemplate[t].personDays > feas.perTemplate[big].personDays) big = t;
+        groupSizes[big] += spare;
+      }
+      const available = rotators.slice();
+      const groups = [];
+      // Evening templates first so evening fairness gets the pick of the pool
+      const tOrder = cfg.templates.map((t, i) => i).sort((x, y) => (cfg.templates[y].evening ? 1 : 0) - (cfg.templates[x].evening ? 1 : 0));
+      for (const t of tOrder) {
+        const want = Math.min(groupSizes[t], available.length);
+        let ranked;
+        if (rules.fixedTemplateAcrossCycle && w > 0) {
+          // Times don't change across the cycle: keep last week's group
+          ranked = available.filter(a => burden[a.id].lastWeekTemplate === t);
+        } else {
+          ranked = available.slice().sort((a, b) => {
+            const ba = burden[a.id],
+              bb = burden[b.id];
+            // fewest stints on this template, then (for evening templates) fewest evening
+            // days, then prefer keeping last week's template ONLY if we're minimising
+            // change... no: rotation wants spread, so prefer those who did it longest ago.
+            if (ba.templateCounts[t] !== bb.templateCounts[t]) return ba.templateCounts[t] - bb.templateCounts[t];
+            if (cfg.templates[t].evening && ba.eveningDays !== bb.eveningDays) return ba.eveningDays - bb.eveningDays;
+            return jitter() - 0.5;
+          });
+        }
+        const picked = ranked.slice(0, want);
+        for (const a of picked) available.splice(available.indexOf(a), 1);
+        groups.push({
+          t,
+          members: picked
+        });
+        if (picked.length < groupSizes[t]) {
+          violations.push('Week ' + (w + 1) + ' ' + cfg.templates[t].name + ': needed ' + groupSizes[t] + ' people, got ' + picked.length + '.');
+        }
+      }
+      // ---- Phase 2: within each group, pick who works which days ----
+      for (const g of groups) {
+        const t = g.t;
+        const need = residual[t].slice();
+        const daysLeft = {};
+        for (const a of g.members) daysLeft[a.id] = wd;
+        // Weekends first: they're the scarce fairness resource
+        const dayOrder = [5, 6, 0, 1, 2, 3, 4];
+        for (const d of dayOrder) {
+          let k = need[d];
+          if (k <= 0) continue;
+          const isWeekend = d >= 5;
+          const eligible = g.members.filter(a => {
+            if (daysLeft[a.id] <= 0) return false;
+            if (isWeekend && rules.noConsecutiveWeekends && burden[a.id].workedWeekendLastWeek) return false;
+            if (isWeekend && rules.maxWeekendDaysPerCycle > 0 && burden[a.id].weekendDays >= rules.maxWeekendDaysPerCycle) return false;
+            return true;
+          }).sort((a, b) => {
+            const ba = burden[a.id],
+              bb = burden[b.id];
+            if (isWeekend && ba.weekendDays !== bb.weekendDays) return ba.weekendDays - bb.weekendDays;
+            if (daysLeft[a.id] !== daysLeft[b.id]) return daysLeft[b.id] - daysLeft[a.id];
+            return jitter() - 0.5;
+          });
+          if (eligible.length < k) {
+            violations.push('Week ' + (w + 1) + ' ' + DAYS[d] + ' ' + cfg.templates[t].name + ': short ' + (k - eligible.length) + ' (weekend caps/rules exclude the rest).');
+            k = eligible.length;
+          }
+          for (let i = 0; i < k; i++) {
+            const a = eligible[i];
+            byAgent[a.id][d] = t;
+            daysLeft[a.id]--;
+            if (isWeekend) {
+              burden[a.id].weekendDays++;
+              weekendWorkedThisWeek.add(a.id);
+            }
+            if (cfg.templates[t].evening) burden[a.id].eveningDays++;
+          }
+        }
+        // Leftover contract days become surplus cover (people are paid for a full week).
+        // Prefer weekdays, then use weekends when workDaysPerWeek is 6 or 7.
+        for (const a of g.members) {
+          while (daysLeft[a.id] > 0) {
+            let best = -1;
+            for (const d of [0, 1, 2, 3, 4, 5, 6]) {
+              if (byAgent[a.id][d] !== -1) continue;
+              const isWeekend = d >= 5;
+              if (isWeekend && rules.noConsecutiveWeekends && burden[a.id].workedWeekendLastWeek) continue;
+              if (isWeekend && rules.maxWeekendDaysPerCycle > 0 && burden[a.id].weekendDays >= rules.maxWeekendDaysPerCycle) continue;
+              best = d;
+              break;
+            }
+            if (best === -1) {
+              violations.push('Week ' + (w + 1) + ' ' + a.name + ': could not place ' + daysLeft[a.id] + ' remaining contract day(s) without breaching weekend rules.');
+              break;
+            }
+            byAgent[a.id][best] = t;
+            if (best >= 5) {
+              burden[a.id].weekendDays++;
+              weekendWorkedThisWeek.add(a.id);
+            }
+            if (cfg.templates[t].evening) burden[a.id].eveningDays++;
+            daysLeft[a.id]--;
+          }
+        }
+        for (const a of g.members) {
+          // Week-block: ONE start time for the whole week → one band offset per person-
+          // week, chosen against the under-coverage across all their working days.
+          // Under "days vary, times don't", the offset locks for the whole cycle.
+          const days = [];
+          for (let d = 0; d < 7; d++) if (byAgent[a.id][d] === t) days.push(d);
+          const locked = rules.fixedTemplateAcrossCycle && w > 0 && burden[a.id].lockedOffset != null ? burden[a.id].lockedOffset : null;
+          // Week-block starts are constant within the week, so the variance rule only
+          // bites across the Sun→Mon boundary: prefer offsets compatible with last
+          // week's Sunday start when this member works Monday.
+          let allowedOpts = null;
+          if (varianceActive && locked == null && burden[a.id].prevWeekSunStart != null && days.indexOf(0) !== -1) {
+            const f = tplOffsets[t].filter(o => startVarOK(tplStartIdx[t] + o, burden[a.id].prevWeekSunStart));
+            if (f.length) allowedOpts = f;
+          }
+          const off = pickOffset(days, t, locked, allowedOpts);
+          for (const d of days) {
+            offsetByAgent[a.id][d] = off;
+            addCov(d, t, off, 1);
+          }
+          burden[a.id].lockedOffset = off;
+          burden[a.id].templateCounts[t]++;
+          const key = t * 1000 + off;
+          if (burden[a.id].lastWeekKey !== -1 && burden[a.id].lastWeekKey !== key) burden[a.id].weekChanges++;
+          burden[a.id].lastWeekKey = key;
+          burden[a.id].lastWeekTemplate = t;
+        }
+      }
+    } else {
+      // ---- Daily (fluid) mode: any template any day ----
+      const daysLeft = {};
+      for (const a of rotators) daysLeft[a.id] = wd;
+      const dayOrder = [5, 6, 0, 1, 2, 3, 4]; // weekends first (scarce), then weekdays
+      for (const d of dayOrder) {
+        const isWeekend = d >= 5;
+        // Evening templates first so evening fairness gets first pick each day
+        const tOrder = cfg.templates.map((t, i) => i).sort((x, y) => (cfg.templates[y].evening ? 1 : 0) - (cfg.templates[x].evening ? 1 : 0));
+        for (const t of tOrder) {
+          let k = residual[t][d];
+          if (k <= 0) continue;
+          const eligible = rotators.filter(a => {
+            if (byAgent[a.id][d] !== -1 || daysLeft[a.id] <= 0) return false;
+            if (isWeekend && rules.noConsecutiveWeekends && burden[a.id].workedWeekendLastWeek) return false;
+            if (isWeekend && rules.maxWeekendDaysPerCycle > 0 && burden[a.id].weekendDays >= rules.maxWeekendDaysPerCycle) return false;
+            if (varianceActive) {
+              // Must have at least one band offset compatible with the starts already
+              // assigned on adjacent worked days (drift cap works across templates too).
+              const ns = neighborStarts(a.id, d);
+              if (ns.length && !tplOffsets[t].some(o => ns.every(nsi => startVarOK(tplStartIdx[t] + o, nsi)))) return false;
+            }
+            return true;
+          }).sort((a, b) => {
+            const ba = burden[a.id],
+              bb = burden[b.id];
+            if (cfg.templates[t].evening) {
+              // Below-minimum people first, then fewest evening days
+              const aUnder = rules.minEveningShiftsPerCycle > 0 && ba.eveningDays < rules.minEveningShiftsPerCycle ? 0 : 1;
+              const bUnder = rules.minEveningShiftsPerCycle > 0 && bb.eveningDays < rules.minEveningShiftsPerCycle ? 0 : 1;
+              if (aUnder !== bUnder) return aUnder - bUnder;
+              if (ba.eveningDays !== bb.eveningDays) return ba.eveningDays - bb.eveningDays;
+            }
+            if (isWeekend && ba.weekendDays !== bb.weekendDays) return ba.weekendDays - bb.weekendDays;
+            if (daysLeft[a.id] !== daysLeft[b.id]) return daysLeft[b.id] - daysLeft[a.id];
+            return jitter() - 0.5;
+          });
+          if (eligible.length < k) {
+            violations.push('Week ' + (w + 1) + ' ' + DAYS[d] + ' ' + cfg.templates[t].name + ': short ' + (k - eligible.length) + '.');
+            k = eligible.length;
+          }
+          for (let i = 0; i < k; i++) {
+            const a = eligible[i];
+            byAgent[a.id][d] = t;
+            // Fluid mode: band offset chosen per person-day against this day's curve,
+            // restricted to offsets that respect the start-variance rule vs neighbours
+            let allowedOpts = null;
+            if (varianceActive) {
+              const ns = neighborStarts(a.id, d);
+              if (ns.length) {
+                const f = tplOffsets[t].filter(o => ns.every(nsi => startVarOK(tplStartIdx[t] + o, nsi)));
+                if (f.length) allowedOpts = f;
+              }
+            }
+            const off = pickOffset([d], t, null, allowedOpts);
+            offsetByAgent[a.id][d] = off;
+            addCov(d, t, off, 1);
+            daysLeft[a.id]--;
+            if (isWeekend) {
+              burden[a.id].weekendDays++;
+              weekendWorkedThisWeek.add(a.id);
+            }
+            if (cfg.templates[t].evening) burden[a.id].eveningDays++;
+          }
+        }
+      }
+      // Demand may use fewer person-days than the rotating pool's configured contracts.
+      // Roster every remaining contract day as surplus cover, choosing the day/template/
+      // band offset that fills the most forecast under-coverage while respecting hard rules.
+      for (const a of rotators) {
+        while (daysLeft[a.id] > 0) {
+          let best = null;
+          for (let d = 0; d < 7; d++) {
+            if (byAgent[a.id][d] !== -1) continue;
+            const isWeekend = d >= 5;
+            if (isWeekend && rules.noConsecutiveWeekends && burden[a.id].workedWeekendLastWeek) continue;
+            if (isWeekend && rules.maxWeekendDaysPerCycle > 0 && burden[a.id].weekendDays >= rules.maxWeekendDaysPerCycle) continue;
+            const ns = varianceActive ? neighborStarts(a.id, d) : [];
+            for (let t = 0; t < nT; t++) {
+              let opts = tplOffsets[t];
+              if (ns.length) opts = opts.filter(o => ns.every(nsi => startVarOK(tplStartIdx[t] + o, nsi)));
+              if (!opts.length) continue;
+              const off = pickOffset([d], t, null, opts);
+              const gain = offsetGain([d], t, off);
+              const needsEvening = rules.minEveningShiftsPerCycle > 0 && burden[a.id].eveningDays < rules.minEveningShiftsPerCycle;
+              const eveningFit = needsEvening ? cfg.templates[t].evening ? 1 : 0 : cfg.templates[t].evening ? 0 : 1;
+              const candidate = {
+                d,
+                t,
+                off,
+                gain,
+                eveningFit,
+                weekdayFit: isWeekend ? 0 : 1
+              };
+              if (!best || candidate.gain > best.gain || candidate.gain === best.gain && candidate.eveningFit > best.eveningFit || candidate.gain === best.gain && candidate.eveningFit === best.eveningFit && candidate.weekdayFit > best.weekdayFit) best = candidate;
+            }
+          }
+          if (!best) {
+            violations.push('Week ' + (w + 1) + ' ' + a.name + ': could not place ' + daysLeft[a.id] + ' remaining contract day(s) without breaching rotation rules.');
+            break;
+          }
+          byAgent[a.id][best.d] = best.t;
+          offsetByAgent[a.id][best.d] = best.off;
+          addCov(best.d, best.t, best.off, 1);
+          daysLeft[a.id]--;
+          if (best.d >= 5) {
+            burden[a.id].weekendDays++;
+            weekendWorkedThisWeek.add(a.id);
+          }
+          if (cfg.templates[best.t].evening) burden[a.id].eveningDays++;
+        }
+      }
+      // Track week-to-week start-time variety for churn stats. A "start" is a
+      // (template, band offset) pair — a different start inside the same band counts
+      // as churn just like a different template.
+      for (const a of rotators) {
+        const usedT = new Set(byAgent[a.id].filter(x => x !== -1));
+        const usedKeys = new Set();
+        let firstKey = -1;
+        for (let d = 0; d < 7; d++) {
+          if (byAgent[a.id][d] === -1) continue;
+          const key = byAgent[a.id][d] * 1000 + (offsetByAgent[a.id][d] || 0);
+          if (firstKey === -1) firstKey = key;
+          usedKeys.add(key);
+        }
+        if (usedKeys.size > 0) {
+          for (const t of usedT) burden[a.id].templateCounts[t] = (burden[a.id].templateCounts[t] || 0) + 1;
+          if (burden[a.id].lastWeekKey !== -1 && burden[a.id].lastWeekKey !== firstKey) burden[a.id].weekChanges++;
+          burden[a.id].lastWeekKey = firstKey;
+          burden[a.id].lastWeekTemplate = byAgent[a.id].find(x => x !== -1);
+          if (usedKeys.size > 1) burden[a.id].weekChanges += usedKeys.size - 1; // intra-week start-time changes
+        }
+      }
+    }
+    // ---- Start-variance validation (authoritative — the greedy enforcement above is
+    // best-effort, so anything it couldn't honour is reported here) ----
+    if (varianceActive) {
+      let breaches = 0;
+      for (const a of rotators) {
+        const starts = [];
+        for (let d = 0; d < 7; d++) starts.push(byAgent[a.id][d] === -1 ? null : tplStartIdx[byAgent[a.id][d]] + (offsetByAgent[a.id][d] || 0));
+        if (burden[a.id].prevWeekSunStart != null && starts[0] != null && !startVarOK(starts[0], burden[a.id].prevWeekSunStart)) breaches++;
+        for (let d = 0; d < 6; d++) if (starts[d] != null && starts[d + 1] != null && !startVarOK(starts[d + 1], starts[d])) breaches++;
+      }
+      if (breaches > 0) violations.push('Week ' + (w + 1) + ': ' + breaches + ' consecutive-day start pair(s) breach the start-variance rule (min ' + rules.minStartVarianceMin + ' / max ' + rules.maxStartVarianceMin + ' min)' + (rules.mode === 'weekBlock' && rules.minStartVarianceMin > 0 ? ' — a minimum variance can never be met in week-block mode: starts are constant within a week' : '') + '.');
+    }
+    for (const a of rotators) {
+      burden[a.id].workedWeekendLastWeek = weekendWorkedThisWeek.has(a.id);
+      burden[a.id].prevWeekSunStart = byAgent[a.id][6] !== -1 ? tplStartIdx[byAgent[a.id][6]] + (offsetByAgent[a.id][6] || 0) : null;
+    }
+    weeks.push({
+      byAgent,
+      offsetByAgent
+    });
+  }
+  // ---- Cycle-level rule validation ----
+  if (rules.minEveningShiftsPerCycle > 0) {
+    const under = rotators.filter(a => burden[a.id].eveningDays < rules.minEveningShiftsPerCycle);
+    if (under.length) {
+      violations.push(under.length + ' rotator(s) below the ' + rules.minEveningShiftsPerCycle + '-evening minimum this cycle (e.g. ' + under.slice(0, 3).map(a => a.name).join(', ') + (under.length > 3 ? '…' : '') + ')' + (rules.fixedTemplateAcrossCycle ? ' — expected: fixed-template mode pins evening work to the late group.' : '.'));
+    }
+  }
+  return {
+    feas,
+    weeks,
+    burden,
+    violations,
+    notes
+  };
+}
+
+// Availability per day/interval for one rotation week: rotators from their day-template
+// assignments (breaks/lunch carved out via the normal schedule builder, so it's
+// apples-to-apples with the main simulation), plus exempt agents on their fixed shifts.
+function rotationWeekAvailability(state, weekAssign) {
+  const cfg = rotationConfig(state);
+  const stateLike = {
+    config: state.config
+  };
+  const avail = [];
+  for (let d = 0; d < 7; d++) avail.push(new Array(INTERVALS_PER_DAY).fill(0));
+  for (let d = 0; d < 7; d++) {
+    for (const a of state.agents || []) {
+      let synth = null;
+      if (a.rotationExempt) {
+        if ((a.workDays || []).includes(d) || (a.workDays || []).includes((d + 6) % 7)) synth = a;
+      } else {
+        const assign = weekAssign.byAgent[a.id];
+        const t = assign ? assign[d] : -1;
+        if (t !== -1) {
+          // Apply the band offset: a later start inside the band shifts the end too
+          const off = weekAssign.offsetByAgent && weekAssign.offsetByAgent[a.id] ? weekAssign.offsetByAgent[a.id][d] || 0 : 0;
+          const sIdx = timeToIdx(cfg.templates[t].start) + off;
+          const eRaw = cfg.templates[t].end === '00:00' ? INTERVALS_PER_DAY : timeToIdx(cfg.templates[t].end);
+          const eIdx = Math.min(INTERVALS_PER_DAY, eRaw + off);
+          synth = {
+            id: a.id,
+            name: a.name,
+            shiftStart: idxToTime(sIdx),
+            shiftEnd: eIdx >= INTERVALS_PER_DAY ? '00:00' : idxToTime(eIdx),
+            workDays: [d]
+          };
+        }
+      }
+      if (!synth) continue;
+      const {
+        row
+      } = buildScheduleForAgent(stateLike, synth, d, []);
+      for (let i = 0; i < INTERVALS_PER_DAY; i++) if (row[i] === 'work') avail[d][i]++;
+    }
+  }
+  return avail;
+}
+
+// SL + FTE for every week of the cycle under the generated rotation. Required FTE comes
+// from the forecast's required-agents curve; scheduled FTE from actual on-queue
+// person-intervals (breaks/lunch already carved out) — both in the same fteWeeklyHours
+// currency so "required vs scheduled while adhering to the pattern" is one comparison.
+function rotationCycleSL(state, gen) {
+  const cfg = rotationConfig(state);
+  const reqGrid = rotationRequiredGrid(state);
+  let requiredH = 0;
+  for (let d = 0; d < 7; d++) for (let i = 0; i < INTERVALS_PER_DAY; i++) requiredH += reqGrid[d][i] * (INTERVAL_MIN / 60);
+  const requiredFTE = requiredH / cfg.fteWeeklyHours;
+  const out = [];
+  for (const week of gen.weeks) {
+    const avail = rotationWeekAvailability(state, week);
+    const sla = computeSLA(state.volume, avail, state.config);
+    let calls = 0,
+      within = 0,
+      breaches = 0,
+      intervals = 0,
+      scheduledH = 0,
+      underH = 0;
+    for (let d = 0; d < 7; d++) {
+      for (let i = 0; i < INTERVALS_PER_DAY; i++) {
+        scheduledH += (avail[d][i] || 0) * (INTERVAL_MIN / 60);
+        if ((avail[d][i] || 0) < reqGrid[d][i]) underH += (reqGrid[d][i] - avail[d][i]) * (INTERVAL_MIN / 60);
+      }
+      const s = getDayStartIdx(state.config, d),
+        e = getDayEndIdx(state.config, d);
+      if (isDayClosed(state.config, d)) continue;
+      for (let i = s; i < e; i++) {
+        const r = sla[d][i];
+        if (!r || r.calls <= 0) continue;
+        calls += r.calls;
+        within += r.calls * r.sl;
+        intervals++;
+        if (r.sl < (state.config.slTargetPct || 0.8)) breaches++;
+      }
+    }
+    out.push({
+      sl: calls > 0 ? within / calls : 1,
+      calls,
+      breaches,
+      intervals,
+      avail,
+      requiredH,
+      scheduledH,
+      underH,
+      requiredFTE,
+      scheduledFTE: scheduledH / cfg.fteWeeklyHours,
+      underFTE: underH / cfg.fteWeeklyHours
+    });
   }
   return out;
 }
@@ -7944,7 +8958,23 @@ function ConfigPanel({
       alignSelf: 'center',
       textAlign: 'right'
     }
-  }, c.model === 'A' ? 'Realistic — callers hang up after avg patience. Lowers required headcount.' : 'Classic — infinite patience. Standard for planning, slightly conservative.')), sectionHeading('Service Targets', 'Defines what counts as a breach and feeds the queue math'), /*#__PURE__*/React.createElement("div", {
+  }, c.model === 'A' ? 'Realistic — callers hang up after avg patience. Lowers required headcount.' : 'Classic — infinite patience. Standard for planning, slightly conservative.')), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: '8px',
+      padding: '9px 11px',
+      background: 'rgba(var(--warn-rgb), 0.07)',
+      border: '1px solid rgba(var(--warn-rgb), 0.28)',
+      borderRadius: '3px',
+      color: 'var(--ink-dim)',
+      fontFamily: 'var(--mono)',
+      fontSize: '10px',
+      lineHeight: 1.5
+    }
+  }, /*#__PURE__*/React.createElement("strong", {
+    style: {
+      color: 'var(--warn)'
+    }
+  }, "Model scope: "), "Each 15-minute interval is evaluated as a steady-state queue. Calls waiting at the interval boundary are not carried into the next interval, so sharp spikes or outages may recover faster here than in a transient/discrete-event simulation."), sectionHeading('Service Targets', 'Defines what counts as a breach and feeds the queue math'), /*#__PURE__*/React.createElement("div", {
     className: "grid-4"
   }, /*#__PURE__*/React.createElement("label", {
     className: "field"
@@ -8486,6 +9516,21 @@ function detectPasteKind(values) {
   };
 }
 
+// Scale non-negative interval weights while preserving a possibly fractional total. Forecast
+// calls are expected arrival rates, not observed integer events; quantizing them before Erlang
+// evaluation creates artificial spikes on low-volume desks.
+function scaleRowPreservingTotal(raw, dayTotal) {
+  const target = Math.max(0, +dayTotal || 0);
+  const row = raw.map(v => Math.max(0, +v || 0));
+  const sum = row.reduce((a, b) => a + b, 0);
+  if (target === 0 || sum === 0) return row.map(() => 0);
+  const scaled = row.map(v => v / sum * target);
+  let maxIdx = 0;
+  for (let i = 1; i < scaled.length; i++) if (scaled[i] > scaled[maxIdx]) maxIdx = i;
+  scaled[maxIdx] += target - scaled.reduce((a, b) => a + b, 0);
+  return scaled;
+}
+
 // Apply a SHAPE pattern (percentages) to generate 7 days of volume, given total weekly calls.
 // Pattern's dayMults control day-of-week distribution.
 function applyShapePatternToVolume(pattern, totalWeekly, config) {
@@ -8501,6 +9546,8 @@ function applyShapePatternToVolume(pattern, totalWeekly, config) {
     effMults[d] = Math.max(0, dayMults[d] || 1);
   }
   const multSum = effMults.reduce((a, b) => a + b, 0);
+  // Normalize day weights against the weekly total without quantizing expected calls.
+  const dayTotals = scaleRowPreservingTotal(effMults, totalWeekly);
   for (let d = 0; d < 7; d++) {
     if (effMults[d] === 0) {
       grid.push(new Array(INTERVALS_PER_DAY).fill(0));
@@ -8512,12 +9559,12 @@ function applyShapePatternToVolume(pattern, totalWeekly, config) {
     const rawShape = dayShapes[sourceDay] || dayShapes[workingDays[0]] || new Array(INTERVALS_PER_DAY).fill(0);
     const masked = rawShape.map((v, i) => i >= startIdx && i < endIdx ? Math.max(0, v || 0) : 0);
     const sumMasked = masked.reduce((a, b) => a + b, 0);
-    const dayTotal = multSum > 0 ? totalWeekly * effMults[d] / multSum : 0;
+    const dayTotal = dayTotals[d];
     if (sumMasked === 0) {
       grid.push(new Array(INTERVALS_PER_DAY).fill(0));
       continue;
     }
-    const row = masked.map(v => Math.round(v / sumMasked * dayTotal));
+    const row = scaleRowPreservingTotal(masked, dayTotal);
     grid.push(row);
   }
   return grid;
@@ -8539,7 +9586,7 @@ function applyVolumePattern(pattern, config) {
     const sourceDay = pattern.sharedShape ? workingDays[0] : d;
     const rawShape = dayShapes[sourceDay] || dayShapes[workingDays[0]] || new Array(INTERVALS_PER_DAY).fill(0);
     // Volume patterns use values directly, masked to desk hours
-    const row = rawShape.map((v, i) => i >= startIdx && i < endIdx ? Math.round(Math.max(0, v || 0)) : 0);
+    const row = rawShape.map((v, i) => i >= startIdx && i < endIdx ? Math.max(0, +v || 0) : 0);
     grid.push(row);
   }
   return grid;
@@ -8566,7 +9613,7 @@ function applyShapePatternPerDayTotals(pattern, perDayTotals, config) {
       grid.push(new Array(INTERVALS_PER_DAY).fill(0));
       continue;
     }
-    grid.push(masked.map(v => Math.round(v / sumMasked * dayTotal)));
+    grid.push(scaleRowPreservingTotal(masked, dayTotal));
   }
   return grid;
 }
@@ -8617,6 +9664,11 @@ function parseVerintCsvRow(line) {
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
     if (c === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+        continue;
+      }
       inQuotes = !inQuotes;
       continue;
     }
@@ -8638,6 +9690,9 @@ function parseVerintTime(s) {
   if (!m) return null;
   let h = parseInt(m[1], 10);
   const min = parseInt(m[2], 10);
+  // Validate ranges: the regex alone accepted "25:00 PM" (→ 1500 min), which downstream
+  // could write cells onto the wrong day via the overnight wrap branch.
+  if (h < 1 || h > 12 || min > 59) return null;
   const ap = m[3].toUpperCase();
   if (ap === 'PM' && h < 12) h += 12;
   if (ap === 'AM' && h === 12) h = 0;
@@ -8978,8 +10033,11 @@ function parseVerintSchedule(text, activityMapping, opts) {
       const sEnd = medianMin(shiftEnds);
       const minToTime = m => {
         if (m === null) return '09:00';
-        const h = Math.floor(m / 60);
-        const mm = m % 60;
+        // Snap to the 15-min grid: real rosters contain off-grid times (09:10) which
+        // would give the agent fractional shift indices downstream (zero availability).
+        const snapped = snapToIntervalIdx(m) * INTERVAL_MIN % 1440;
+        const h = Math.floor(snapped / 60);
+        const mm = snapped % 60;
         return String(h).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
       };
 
@@ -9217,8 +10275,11 @@ function parseVerintSchedule(text, activityMapping, opts) {
   }, () => []);
   const minToTime = m => {
     if (m === null || m === undefined) return '09:00';
-    const h = Math.floor(m / 60);
-    const mm = m % 60;
+    // Snap to the 15-min grid: off-grid median shift times (09:10) would give the
+    // agent fractional shift indices downstream (zero availability, untrainable).
+    const snapped = snapToIntervalIdx(m) * INTERVAL_MIN % 1440;
+    const h = Math.floor(snapped / 60);
+    const mm = snapped % 60;
     return String(h).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
   };
   const medianMin = arr => {
@@ -9294,7 +10355,21 @@ function distributeVolume(totalWeekly, shapeKey, profileKey, config) {
     const h = i * INTERVAL_MIN / 60 + INTERVAL_MIN / 120;
     curve[i] = Math.max(0, shape.fn(h));
   }
-  const multSum = profile.mults.reduce((a, b) => a + b, 0);
+  // Weekly-total semantics: sum multipliers over OPEN days only, so closed days' share is
+  // redistributed across the open days (matching applyShapePatternToVolume). Previously
+  // closed days silently swallowed their share — 3000/week with weekends closed produced
+  // a 2678-call grid from the built-in curves but 3000 from a shape pattern.
+  let multSum = 0;
+  for (let d = 0; d < 7; d++) {
+    if (!isDayClosed(config, d)) multSum += profile.mults[d];
+  }
+  // Normalize day weights against the weekly total without quantizing expected calls.
+  const rawDayTotals = new Array(7).fill(0);
+  for (let d = 0; d < 7; d++) {
+    if (isDayClosed(config, d) || profile.mults[d] === 0) continue;
+    rawDayTotals[d] = multSum > 0 ? totalWeekly * profile.mults[d] / multSum : 0;
+  }
+  const dayTotals = scaleRowPreservingTotal(rawDayTotals, totalWeekly);
   const grid = [];
   for (let d = 0; d < 7; d++) {
     if (isDayClosed(config, d) || profile.mults[d] === 0) {
@@ -9310,8 +10385,8 @@ function distributeVolume(totalWeekly, shapeKey, profileKey, config) {
       for (let i = dStart; i < dEnd; i++) masked[i] = 1;
       mSum = dEnd - dStart;
     }
-    const dayTotal = multSum > 0 ? totalWeekly * profile.mults[d] / multSum : 0;
-    const row = masked.map(v => Math.round(v / mSum * dayTotal));
+    const dayTotal = dayTotals[d];
+    const row = scaleRowPreservingTotal(masked, dayTotal);
     grid.push(row);
   }
   return grid;
@@ -9344,7 +10419,7 @@ function regenerateVolumeFromUI(state) {
       if (ui.quickInput === 'weekly') {
         weeklyToUse = ui.weeklyTotal || 0;
       } else {
-        const wd = (pat.workingDays || []).length || 1;
+        const wd = (pat.workingDays || []).filter(d => !isDayClosed(config, d)).length || 1;
         weeklyToUse = (ui.dailyTotal || 0) * wd;
       }
       fresh = applyShapePatternToVolume(pat, weeklyToUse, config);
@@ -9378,7 +10453,7 @@ function regenerateVolumeFromUI(state) {
           for (let i = dStart; i < dEnd; i++) masked[i] = 1;
           mSum = dEnd - dStart;
         }
-        fresh.push(masked.map(v => Math.round(v / mSum * total)));
+        fresh.push(scaleRowPreservingTotal(masked, total));
       }
     } else {
       let weeklyToUse;
@@ -9386,9 +10461,8 @@ function regenerateVolumeFromUI(state) {
         weeklyToUse = ui.weeklyTotal || 0;
       } else {
         const prof = WEEKDAY_PROFILES[ui.profile] || WEEKDAY_PROFILES.seven_day_typical;
-        const workingDays = prof.mults.filter(m => m > 0).length;
-        const avgMult = prof.mults.reduce((a, b) => a + b, 0) / Math.max(1, workingDays);
-        weeklyToUse = (ui.dailyTotal || 0) * workingDays * avgMult;
+        const workingDays = prof.mults.filter((m, d) => m > 0 && !isDayClosed(config, d)).length || 1;
+        weeklyToUse = (ui.dailyTotal || 0) * workingDays;
       }
       fresh = distributeVolume(weeklyToUse, ui.shape || 'standard', ui.profile || 'seven_day_typical', config);
     }
@@ -10577,7 +11651,7 @@ function PatternEditor({
           }
         }
         if (headerIdx < 0) throw new Error('Could not find Verint header row (expected line with "Queue Name" and "Volume")');
-        const cols = lines[headerIdx].split(',').map(c => c.trim());
+        const cols = parseVerintCsvRow(lines[headerIdx]).map(c => c.trim());
         const dateCol = cols.findIndex(c => c === 'Date');
         const timeCol = cols.findIndex(c => c === 'Time');
         const volCol = cols.findIndex(c => c === 'Volume (Absolute Act)');
@@ -10603,7 +11677,7 @@ function PatternEditor({
         for (let li = headerIdx + 1; li < lines.length; li++) {
           const raw = lines[li].trim();
           if (!raw) continue;
-          const parts = raw.split(',');
+          const parts = parseVerintCsvRow(raw);
           if (parts.length <= Math.max(dateCol, timeCol, volCol)) {
             rowsSkipped++;
             continue;
@@ -10672,7 +11746,7 @@ function PatternEditor({
         }
         if (rowsParsed === 0) throw new Error('No data rows could be parsed. Check the file format.');
 
-        // Build the pattern: for each DOW, average across weeks; round to integers.
+        // Build the pattern: for each DOW, average across weeks while retaining fractional rates.
         // workingDays = those DOWs that have ANY volume across the whole window.
         const dayShapes = {};
         const workingDays = [];
@@ -10684,7 +11758,7 @@ function PatternEditor({
             const b = dayBuckets[d][i];
             if (b.count > 0) {
               const avg = b.sum / b.count;
-              shape[i] = Math.round(avg);
+              shape[i] = avg;
               dayTotal += shape[i];
             }
           }
@@ -16411,6 +17485,640 @@ function ScheduleView({
 //
 // Each tab is { id, label, render: () => <Panel ... /> }. The render function is invoked
 // only for the active tab — inactive tabs aren't mounted, so their work isn't computed.
+// =============================================================================
+// ROTATION LAB PANEL
+// =============================================================================
+function RotationPanel({
+  state,
+  setState,
+  sla
+}) {
+  const h = React.createElement;
+  const rot = state.rotation || DEFAULT_STATE.rotation;
+  const agents = state.agents || [];
+  const rules = Object.assign({}, DEFAULT_STATE.rotation.rules, rot.rules || {});
+  const templates = rot.templates && rot.templates.length ? rot.templates : DEFAULT_STATE.rotation.templates;
+  const update = patch => setState(Object.assign({}, state, {
+    rotation: Object.assign({}, DEFAULT_STATE.rotation, rot, patch)
+  }));
+  const updateRules = patch => update({
+    rules: Object.assign({}, rules, patch)
+  });
+  const setAgentExempt = (id, ex) => setState(Object.assign({}, state, {
+    agents: agents.map(a => a.id === id ? Object.assign({}, a, {
+      rotationExempt: ex
+    }) : a)
+  }));
+  const bulkExempt = pct => {
+    const n = Math.round(agents.length * pct / 100);
+    setState(Object.assign({}, state, {
+      agents: agents.map((a, i) => Object.assign({}, a, {
+        rotationExempt: i < n
+      }))
+    }));
+  };
+  const updateTemplate = (idx, patch) => update({
+    templates: templates.map((t, i) => i === idx ? Object.assign({}, t, patch) : t)
+  });
+  const updateDemand = (idx, day, v) => {
+    const d = (templates[idx].demand || new Array(7).fill(0)).slice();
+    d[day] = v;
+    updateTemplate(idx, {
+      demand: d
+    });
+  };
+  const addTemplate = () => update({
+    templates: templates.concat([{
+      id: 'T' + (Date.now() % 100000),
+      name: 'Shift ' + (templates.length + 1),
+      start: '09:00',
+      end: '17:00',
+      evening: false,
+      demand: [0, 0, 0, 0, 0, 0, 0]
+    }])
+  });
+  const removeTemplate = idx => update({
+    templates: templates.filter((_, i) => i !== idx)
+  });
+
+  // Live arithmetic — cheap, recomputes on every input change.
+  const feas = useMemo(() => rotationFeasibility(state), [state]);
+  // Required FTE straight from the forecast — roster-independent, so it can show live
+  // before any generation as the target the pattern has to hit.
+  const reqFTE = useMemo(() => {
+    const grid = rotationRequiredGrid(state);
+    let hrs = 0;
+    for (let d = 0; d < 7; d++) for (let i = 0; i < INTERVALS_PER_DAY; i++) hrs += grid[d][i] * (INTERVAL_MIN / 60);
+    return hrs / rotationConfig(state).fteWeeklyHours;
+  }, [state.volume, state.config, rot.fteWeeklyHours]);
+  const exemptCount = agents.filter(a => a.rotationExempt).length;
+  const [result, setResult] = useState(null);
+  const [showBurden, setShowBurden] = useState(false);
+  const [showPool, setShowPool] = useState(false);
+  const run = () => {
+    const g = generateRotation(state);
+    const slWeeks = rotationCycleSL(state, g);
+    setResult({
+      g,
+      slWeeks
+    });
+  };
+
+  // Baseline weekly SL from the CURRENT roster (same call-weighting as the cycle SL).
+  const baselineSL = useMemo(() => {
+    if (!sla) return null;
+    let calls = 0,
+      within = 0;
+    for (let d = 0; d < 7; d++) {
+      if (isDayClosed(state.config, d)) continue;
+      const s = getDayStartIdx(state.config, d),
+        e = getDayEndIdx(state.config, d);
+      for (let i = s; i < e; i++) {
+        const r = sla[d][i];
+        if (!r || r.calls <= 0) continue;
+        calls += r.calls;
+        within += r.calls * r.sl;
+      }
+    }
+    return calls > 0 ? within / calls : 1;
+  }, [sla, state.config]);
+  const chip = (label, value, tone, title) => h("div", {
+    title: title,
+    style: {
+      padding: '6px 10px',
+      border: '1px solid ' + (tone === 'bad' ? 'var(--bad)' : tone === 'good' ? 'var(--good)' : 'var(--line-2)'),
+      borderRadius: '4px',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px'
+    }
+  }, h("div", {
+    style: {
+      color: 'var(--ink-dim)',
+      fontSize: '9px',
+      textTransform: 'uppercase'
+    }
+  }, label), h("div", {
+    style: {
+      fontSize: '14px',
+      color: tone === 'bad' ? 'var(--bad)' : tone === 'good' ? 'var(--good)' : 'var(--ink)'
+    }
+  }, value));
+  const fmt1 = x => Math.round(x * 10) / 10;
+  const rotators = rotationRotators(state);
+  const wbMode = rules.mode === 'weekBlock';
+  const stat = arr => arr.length ? {
+    min: Math.min.apply(null, arr),
+    max: Math.max.apply(null, arr),
+    avg: fmt1(arr.reduce((a, b) => a + b, 0) / arr.length)
+  } : {
+    min: 0,
+    max: 0,
+    avg: 0
+  };
+  const applyWeek = w => {
+    if (!result || !wbMode) return;
+    if (!confirm('Overwrite the Agents tab with rotation week ' + (w + 1) + '? Exempt agents keep their shifts. You can undo by re-importing or regenerating agents.')) return;
+    const byAgent = result.g.weeks[w].byAgent;
+    const offsetByAgent = result.g.weeks[w].offsetByAgent || {};
+    setState(Object.assign({}, state, {
+      agents: agents.map(a => {
+        if (a.rotationExempt) return a;
+        const assign = byAgent[a.id];
+        if (!assign) return a;
+        const days = [];
+        let tIdx = -1,
+          off = 0;
+        for (let d = 0; d < 7; d++) if (assign[d] !== -1) {
+          days.push(d);
+          tIdx = assign[d];
+          off = (offsetByAgent[a.id] || [])[d] || 0;
+        }
+        if (tIdx === -1) return Object.assign({}, a, {
+          workDays: []
+        });
+        // Apply the band offset (constant across the week in week-block mode)
+        const sIdx = timeToIdx(templates[tIdx].start) + off;
+        const eRaw = templates[tIdx].end === '00:00' ? INTERVALS_PER_DAY : timeToIdx(templates[tIdx].end);
+        const eIdx = Math.min(INTERVALS_PER_DAY, eRaw + off);
+        return Object.assign({}, a, {
+          shiftStart: idxToTime(sIdx),
+          shiftEnd: eIdx >= INTERVALS_PER_DAY ? '00:00' : idxToTime(eIdx),
+          workDays: days
+        });
+      })
+    }));
+  };
+  const sectionHead = (title, meta) => h("div", {
+    className: "panel-h"
+  }, h("h2", null, title), meta && h("span", {
+    className: "h-meta"
+  }, meta));
+
+  return h(Fragment, null,
+  // ---------- Pool + rules + templates ----------
+  h("div", {
+    className: "panel"
+  }, sectionHead("Rotation Lab", "simulate shift-rotation rule sets · burden · slack · service level"), h("div", {
+    className: "panel-b"
+  }, h("div", {
+    style: {
+      display: 'flex',
+      gap: '8px',
+      flexWrap: 'wrap',
+      marginBottom: '12px'
+    }
+  }, chip('Rotating pool', rotators.length + ' of ' + agents.length, rotators.length === 0 ? 'bad' : undefined), chip('Exempt (fixed shifts)', exemptCount), chip(wbMode ? 'Person-weeks needed' : 'Peak daily need', wbMode ? feas.personWeeksNeeded + ' / ' + rotators.length : feas.maxDailyNeed + ' / ' + rotators.length, feas.margin < 0 ? 'bad' : undefined), chip('Slack (margin)', (feas.margin >= 0 ? '+' : '') + feas.margin + ' people', feas.margin < 0 ? 'bad' : feas.margin <= 2 ? undefined : 'good'), chip('Exemption headroom', feas.margin >= 0 ? feas.exemptionHeadroom + ' more' : 'none — already short', feas.margin < 0 ? 'bad' : feas.exemptionHeadroom <= 2 ? undefined : 'good'), chip('Fair share · evenings', fmt1(feas.eveningPerPersonPerCycle) + ' days/cycle'), chip('Fair share · weekends', fmt1(feas.weekendPerPersonPerCycle) + ' days/cycle'), chip('Required FTE (forecast)', fmt1(reqFTE) + ' FTE/wk'), feas.eveningPod.personDays > 0 && chip('Dedicated evening/night pod', feas.eveningPod.people + ' people · ' + fmt1(feas.eveningPod.fte) + ' FTE', undefined, 'If the business hired a group who ONLY work the evening-tagged templates: ' + feas.eveningPod.personDays + ' person-days/week ÷ ' + (rot.workDaysPerWeek || 5) + ' work-days each, floored by the busiest single day. Uses FULL demand — a dedicated pod replaces exempt cover too. Everyone else then rotates days only.'), feas.weekendPod.personDays > 0 && chip('Dedicated weekend pod', feas.weekendPod.people + ' people · ' + fmt1(feas.weekendPod.fte) + ' FTE', undefined, 'If a dedicated group covered ALL weekend demand: ' + feas.weekendPod.personDays + ' person-days/week ÷ 2 (weekend-only hires can work at most Sat+Sun), floored by the busier weekend day. Frees the rotating pool from weekends entirely.')), feas.margin < 0 && h("div", {
+    style: {
+      color: 'var(--bad)',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px',
+      marginBottom: '10px'
+    }
+  }, "⚠ This rule set cannot cover demand with the current rotating pool — it is short by " + Math.abs(feas.margin) + " " + (wbMode ? 'person-week(s) per week' : 'people') + ". Reduce exemptions, add heads, or relax rules."), h("div", {
+    style: {
+      display: 'flex',
+      gap: '16px',
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px'
+    }
+  }, h("label", null, "Mode ", h("select", {
+    value: rules.mode,
+    onChange: e => updateRules({
+      mode: e.target.value
+    })
+  }, h("option", {
+    value: "weekBlock"
+  }, "Week block — same start time all week"), h("option", {
+    value: "daily"
+  }, "Fluid — any shift any day"))), wbMode && h("label", {
+    title: "Over the whole cycle each person keeps ONE start time; only their days vary. Maximum stability — but evening work pins to the late group."
+  }, h("input", {
+    type: "checkbox",
+    checked: !!rules.fixedTemplateAcrossCycle,
+    onChange: e => updateRules({
+      fixedTemplateAcrossCycle: e.target.checked
+    })
+  }), " days vary, times don't (whole cycle)"), h("label", null, "Cycle ", h(NumberInput, {
+    value: rot.cycleWeeks || 4,
+    onChange: v => update({
+      cycleWeeks: v
+    }),
+    min: 1,
+    max: 12,
+    style: {
+      width: '44px'
+    }
+  }), " weeks"), h("label", null, "Work days/week ", h(NumberInput, {
+    value: rot.workDaysPerWeek || 5,
+    onChange: v => update({
+      workDaysPerWeek: v
+    }),
+    min: 1,
+    max: 7,
+    style: {
+      width: '40px'
+    }
+  })), h("label", {
+    title: "Start-band granularity: when a template has a latest start after its earliest start, individual start times are chosen inside the band in steps of this many minutes."
+  }, "Band step ", h(NumberInput, {
+    value: rot.bandStepMin || 30,
+    onChange: v => update({
+      bandStepMin: v
+    }),
+    min: 15,
+    max: 120,
+    step: 15,
+    style: {
+      width: '44px'
+    }
+  }), " min"), h("label", {
+    title: "Hours that count as one FTE-week — used for the required-vs-scheduled FTE callout."
+  }, "Hours/FTE ", h(NumberInput, {
+    value: rot.fteWeeklyHours || 40,
+    onChange: v => update({
+      fteWeeklyHours: v
+    }),
+    min: 1,
+    max: 60,
+    style: {
+      width: '44px'
+    }
+  })), h("label", {
+    title: "Everyone must work at least this many evening shifts (days on evening-tagged templates) per cycle. 0 = rule off."
+  }, "Min evening shifts/cycle ", h(NumberInput, {
+    value: rules.minEveningShiftsPerCycle,
+    onChange: v => updateRules({
+      minEveningShiftsPerCycle: v
+    }),
+    min: 0,
+    max: 28,
+    style: {
+      width: '40px'
+    }
+  })), h("label", {
+    title: "Cap weekend days per person per cycle. 0 = no cap (fair share only)."
+  }, "Max weekend days/cycle ", h(NumberInput, {
+    value: rules.maxWeekendDaysPerCycle,
+    onChange: v => updateRules({
+      maxWeekendDaysPerCycle: v
+    }),
+    min: 0,
+    max: 16,
+    style: {
+      width: '40px'
+    }
+  })), h("label", null, h("input", {
+    type: "checkbox",
+    checked: !!rules.noConsecutiveWeekends,
+    onChange: e => updateRules({
+      noConsecutiveWeekends: e.target.checked
+    })
+  }), " no consecutive weekends"), h("label", {
+    title: "Drift cap between CONSECUTIVE worked days, in minutes. E.g. Monday starts 08:00 with a 60-min cap means Tuesday starts 07:00-09:00 (any band step in between). Applies across templates and across the Sun-to-Mon week boundary; a day off in between resets it. 0 = off."
+  }, "Max start variance ", h(NumberInput, {
+    value: rules.maxStartVarianceMin || 0,
+    onChange: v => updateRules({
+      maxStartVarianceMin: v
+    }),
+    min: 0,
+    max: 720,
+    step: 15,
+    style: {
+      width: '48px'
+    }
+  }), " min"), h("label", {
+    title: "Force at least this much start-time change between consecutive worked days (rare). Incompatible with week-block mode, where starts are constant within a week. 0 = off."
+  }, "Min start variance ", h(NumberInput, {
+    value: rules.minStartVarianceMin || 0,
+    onChange: v => updateRules({
+      minStartVarianceMin: v
+    }),
+    min: 0,
+    max: 720,
+    step: 15,
+    style: {
+      width: '48px'
+    }
+  }), " min"), h("label", null, "Seed ", h(NumberInput, {
+    value: rot.seed || 1,
+    onChange: v => update({
+      seed: v
+    }),
+    min: 1,
+    max: 9999,
+    style: {
+      width: '52px'
+    }
+  }))), h("div", {
+    style: {
+      marginTop: '12px'
+    }
+  }, h("button", {
+    className: "btn ghost sm",
+    onClick: () => setShowPool(!showPool)
+  }, (showPool ? 'Hide' : 'Edit') + ' rotation pool (' + exemptCount + ' exempt)'), h("button", {
+    className: "btn ghost sm",
+    onClick: () => bulkExempt(0),
+    style: {
+      marginLeft: '6px'
+    }
+  }, "All rotate"), h("button", {
+    className: "btn ghost sm",
+    onClick: () => bulkExempt(50),
+    style: {
+      marginLeft: '6px'
+    },
+    title: "Marks the first half of the agent list exempt — then fine-tune below"
+  }, "50% exempt")), showPool && h("div", {
+    style: {
+      marginTop: '10px',
+      maxHeight: '220px',
+      overflowY: 'auto',
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))',
+      gap: '2px 12px',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px',
+      border: '1px solid var(--line)',
+      padding: '8px',
+      borderRadius: '4px'
+    }
+  }, agents.map(a => h("label", {
+    key: a.id,
+    style: {
+      whiteSpace: 'nowrap',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      color: a.rotationExempt ? 'var(--warn)' : 'var(--ink)'
+    },
+    title: a.name + ' · ' + a.shiftStart + '–' + a.shiftEnd + (a.rotationExempt ? ' · exempt (fixed)' : ' · rotates')
+  }, h("input", {
+    type: "checkbox",
+    checked: !!a.rotationExempt,
+    onChange: e => setAgentExempt(a.id, e.target.checked)
+  }), " ", a.name))))),
+  // ---------- Templates + demand ----------
+  h("div", {
+    className: "panel"
+  }, sectionHead("Shift templates & demand", "required headcount per template per day — exempt agents with matching start times are subtracted"), h("div", {
+    className: "panel-b",
+    style: {
+      overflowX: 'auto'
+    }
+  }, h("table", {
+    style: {
+      borderCollapse: 'collapse',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px'
+    }
+  }, h("thead", null, h("tr", null, ['Template', 'Earliest start', 'Latest start', 'End', 'Evening'].concat(DAYS).concat(['Need/wk', '']).map((c, i) => h("th", {
+    key: i,
+    style: {
+      padding: '4px 8px',
+      textAlign: 'left',
+      color: 'var(--ink-dim)',
+      borderBottom: '1px solid var(--line-2)'
+    }
+  }, c)))), h("tbody", null, templates.map((t, ti) => h("tr", {
+    key: t.id
+  }, h("td", {
+    style: {
+      padding: '2px 8px'
+    }
+  }, h("input", {
+    type: "text",
+    value: t.name,
+    onChange: e => updateTemplate(ti, {
+      name: e.target.value
+    }),
+    style: {
+      width: '80px'
+    }
+  })), h("td", null, h("input", {
+    type: "time",
+    value: t.start,
+    step: 900,
+    onChange: e => updateTemplate(ti, {
+      start: e.target.value
+    })
+  })), h("td", null, h("input", {
+    type: "time",
+    value: t.bandLatest || t.start,
+    step: 900,
+    title: "Latest allowed start. Later than the earliest start = a start band: the engine picks each person's start inside the band to best fill the forecast's required-agents curve. Equal = fixed start.",
+    onChange: e => updateTemplate(ti, {
+      bandLatest: e.target.value
+    })
+  })), h("td", null, h("input", {
+    type: "time",
+    value: t.end,
+    step: 900,
+    title: "Shift end when starting at the EARLIEST start — defines shift length. A later start inside the band shifts the end correspondingly.",
+    onChange: e => updateTemplate(ti, {
+      end: e.target.value
+    })
+  })), h("td", {
+    style: {
+      textAlign: 'center'
+    }
+  }, h("input", {
+    type: "checkbox",
+    checked: !!t.evening,
+    onChange: e => updateTemplate(ti, {
+      evening: e.target.checked
+    }),
+    title: "Counts toward the evening-shift fairness rule"
+  })), (t.demand || []).map((v, d) => h("td", {
+    key: d
+  }, h(NumberInput, {
+    value: v,
+    onChange: nv => updateDemand(ti, d, nv),
+    min: 0,
+    max: 999,
+    style: {
+      width: '42px'
+    }
+  }))), h("td", {
+    style: {
+      padding: '2px 8px',
+      color: 'var(--ink-dim)'
+    }
+  }, (t.demand || []).reduce((a, b) => a + b, 0) + 'pd → ' + (feas.perTemplate[ti] ? feas.perTemplate[ti].personWeeks : '—') + 'pw'), h("td", null, h("button", {
+    className: "btn ghost sm",
+    onClick: () => removeTemplate(ti),
+    disabled: templates.length <= 1
+  }, "✕"))))), h("tfoot", null, h("tr", null, h("td", {
+    colSpan: 14,
+    style: {
+      padding: '6px 8px'
+    }
+  }, h("button", {
+    className: "btn ghost sm",
+    onClick: addTemplate
+  }, "+ Add template"), h("span", {
+    style: {
+      marginLeft: '12px',
+      color: 'var(--ink-dim)',
+      fontSize: '10px'
+    }
+  }, "pd = person-days/week after exempt cover · pw = person-weeks needed · restrict start times by only defining the templates you allow (e.g. just 08:00 and 12:00)"))))))),
+  // ---------- Generate + results ----------
+  h("div", {
+    className: "panel"
+  }, sectionHead("Generated rotation", result ? rot.cycleWeeks + '-week cycle · seed ' + (rot.seed || 1) : 'not generated yet'), h("div", {
+    className: "panel-b"
+  }, h("div", {
+    style: {
+      marginBottom: '10px'
+    }
+  }, h("button", {
+    className: "btn sm",
+    onClick: run,
+    disabled: rotators.length === 0
+  }, "Generate cycle"), result && h("span", {
+    style: {
+      marginLeft: '10px',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px',
+      color: result.g.violations.length ? 'var(--bad)' : 'var(--good)'
+    }
+  }, result.g.violations.length ? result.g.violations.length + ' problem(s)' : '✓ all rules satisfied')), result && h(Fragment, null, result.g.violations.length > 0 && h("ul", {
+    style: {
+      color: 'var(--bad)',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px',
+      paddingLeft: '18px',
+      marginBottom: '10px'
+    }
+  }, result.g.violations.map((v, i) => h("li", {
+    key: i
+  }, v))), result.g.notes.length > 0 && h("div", {
+    style: {
+      color: 'var(--ink-dim)',
+      fontFamily: 'var(--mono)',
+      fontSize: '10px',
+      marginBottom: '10px'
+    }
+  }, result.g.notes.join(' · ')), h("div", {
+    style: {
+      display: 'flex',
+      gap: '8px',
+      flexWrap: 'wrap',
+      marginBottom: '12px'
+    }
+  }, baselineSL != null && chip('Current roster SL', Math.round(baselineSL * 100) + '%'), result.slWeeks.map((wk, i) => {
+    const delta = baselineSL != null ? (wk.sl - baselineSL) * 100 : null;
+    return chip('Week ' + (i + 1) + ' SL', Math.round(wk.sl * 100) + '%' + (delta != null ? ' (' + (delta >= 0 ? '+' : '') + fmt1(delta) + 'pp)' : ''), wk.sl < (state.config.slTargetPct || 0.8) ? 'bad' : 'good');
+  })), h("div", {
+    style: {
+      display: 'flex',
+      gap: '8px',
+      flexWrap: 'wrap',
+      marginBottom: '12px'
+    },
+    title: "Required = forecast's required-agents curve converted to FTE. Scheduled = on-queue person-hours this pattern actually delivers (breaks/lunch carved out). 'Under' counts only intervals where scheduled sits BELOW required — a pattern can be over on total FTE and still under at the wrong times of day."
+  }, chip('Required FTE', fmt1(result.slWeeks[0] ? result.slWeeks[0].requiredFTE : 0) + ' FTE/wk'), result.slWeeks.map((wk, i) => {
+    const diff = wk.scheduledFTE - wk.requiredFTE;
+    return chip('Wk ' + (i + 1) + ' scheduled', fmt1(wk.scheduledFTE) + ' FTE (' + (diff >= 0 ? '+' : '') + fmt1(diff) + ')' + (wk.underFTE > 0.05 ? ' · ' + fmt1(wk.underFTE) + ' under' : ''), wk.underFTE > 0.5 ? 'bad' : diff >= 0 ? 'good' : undefined);
+  })), (() => {
+    const evs = rotators.map(a => result.g.burden[a.id].eveningDays);
+    const wks = rotators.map(a => result.g.burden[a.id].weekendDays);
+    const chg = rotators.map(a => result.g.burden[a.id].weekChanges);
+    const se = stat(evs),
+      sw = stat(wks),
+      sc = stat(chg);
+    return h("div", {
+      style: {
+        display: 'flex',
+        gap: '8px',
+        flexWrap: 'wrap',
+        marginBottom: '10px'
+      }
+    }, chip('Evening days/person', se.min + '–' + se.max + ' (avg ' + se.avg + ')'), chip('Weekend days/person', sw.min + '–' + sw.max + ' (avg ' + sw.avg + ')'), chip('Start-time changes/person', sc.min + '–' + sc.max + ' (avg ' + sc.avg + ')', sc.avg <= 1 ? 'good' : undefined));
+  })(), h("div", null, h("button", {
+    className: "btn ghost sm",
+    onClick: () => setShowBurden(!showBurden)
+  }, (showBurden ? 'Hide' : 'Show') + ' per-person burden table'), wbMode && result.g.weeks.map((_, w) => h("button", {
+    key: w,
+    className: "btn ghost sm",
+    style: {
+      marginLeft: '6px'
+    },
+    title: "Overwrite the Agents tab with this week's roster so you can inspect it in the Schedule/Analysis tabs",
+    onClick: () => applyWeek(w)
+  }, "Apply wk " + (w + 1) + " → Agents"))), showBurden && h("div", {
+    style: {
+      marginTop: '10px',
+      maxHeight: '340px',
+      overflowY: 'auto'
+    }
+  }, h("table", {
+    style: {
+      borderCollapse: 'collapse',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px',
+      width: '100%'
+    }
+  }, h("thead", null, h("tr", null, ['Agent'].concat(result.g.weeks.map((_, w) => 'Wk' + (w + 1))).concat(['Evening', 'Weekend', 'Changes']).map((c, i) => h("th", {
+    key: i,
+    style: {
+      padding: '3px 8px',
+      textAlign: 'left',
+      color: 'var(--ink-dim)',
+      borderBottom: '1px solid var(--line-2)',
+      position: 'sticky',
+      top: 0,
+      background: 'var(--panel)'
+    }
+  }, c)))), h("tbody", null, rotators.slice().sort((a, b) => result.g.burden[b.id].eveningDays - result.g.burden[a.id].eveningDays).map(a => {
+    const b = result.g.burden[a.id];
+    return h("tr", {
+      key: a.id
+    }, h("td", {
+      style: {
+        padding: '2px 8px'
+      }
+    }, a.name), result.g.weeks.map((wk, w) => {
+      const assign = wk.byAgent[a.id] || [];
+      const offs = wk.offsetByAgent && wk.offsetByAgent[a.id] || [];
+      const used = [];
+      for (let d = 0; d < 7; d++) if (assign[d] !== -1 && used.indexOf(assign[d]) === -1) used.push(assign[d]);
+      const label = used.length === 0 ? '—' : used.map(t => (templates[t] && templates[t].name || '?').slice(0, 1)).join('/');
+      const wkd = assign[5] !== -1 || assign[6] !== -1;
+      // First actual start time this week (template start + band offset) for the cell label
+      const firstDay = assign.findIndex(x => x !== -1);
+      const startLbl = firstDay >= 0 && templates[assign[firstDay]] ? idxToTime(timeToIdx(templates[assign[firstDay]].start) + (offs[firstDay] || 0)) : '';
+      return h("td", {
+        key: w,
+        style: {
+          padding: '2px 8px',
+          color: used.some(t => templates[t] && templates[t].evening) ? 'var(--warn)' : 'var(--ink)'
+        },
+        title: DAYS.map((dn, d) => {
+          if (assign[d] === -1) return dn + ': off';
+          const tpl = templates[assign[d]];
+          if (!tpl) return dn + ': ?';
+          return dn + ': ' + tpl.name + ' ' + idxToTime(timeToIdx(tpl.start) + (offs[d] || 0));
+        }).join(' · ')
+      }, label + (startLbl ? ' ' + startLbl : '') + (wkd ? '·w/e' : ''));
+    }), h("td", {
+      style: {
+        padding: '2px 8px'
+      }
+    }, b.eveningDays), h("td", {
+      style: {
+        padding: '2px 8px'
+      }
+    }, b.weekendDays), h("td", {
+      style: {
+        padding: '2px 8px'
+      }
+    }, b.weekChanges));
+  }))))))));
+}
+
 //
 // Tab labels and the optional `groupLabel` are kept compact (mono, all-caps) so the bar
 // reads as a navigation strip rather than competing with the panel headers below.
@@ -16803,7 +18511,7 @@ function CoverageChart({
         display: 'flex',
         alignItems: 'flex-end'
       },
-      title: idxToTime(startIdx + i) + ' · ' + r.agents + ' scheduled · ' + r.required + ' required · SL ' + Math.round(r.sl * 100) + '%'
+      title: idxToTime(startIdx + i) + ' · ' + r.agents + ' scheduled · ' + (isFinite(r.required) ? r.required + ' required' : 'unstable') + ' · SL ' + Math.round(r.sl * 100) + '%'
     }, /*#__PURE__*/React.createElement("div", {
       style: {
         width: '100%',
@@ -27730,6 +29438,7 @@ function App() {
   };
   const [loaded, setLoaded] = useState(false);
   const [theme, setTheme] = useState('dark');
+  const [saveWarning, setSaveWarning] = useState(null);
   // Changelog modal state + last-seen-version so we can mark new entries since the user
   // last opened it. Loaded asynchronously from storage; defaults to null (= show "new"
   // badges on every entry until the user opens the modal once).
@@ -27807,7 +29516,15 @@ function App() {
   }, [state.name]);
   useEffect(() => {
     loadState().then(s => {
-      if (s) setState(s);
+      // Backfill defaults, same as the scenario-import path: an auto-saved state from an
+      // older version may miss newer fields (trainingSessions, patterns, config keys...)
+      // and applying it raw crashes buildFullSchedule during render — an unrecoverable
+      // black screen, because the same bad state re-loads on every refresh.
+      if (s) setState(Object.assign({}, DEFAULT_STATE, s, {
+        config: Object.assign({}, DEFAULT_STATE.config, s.config),
+        patterns: s.patterns || {},
+        trainingSessions: s.trainingSessions || []
+      }));
       setLoaded(true);
     });
   }, []);
@@ -27818,10 +29535,18 @@ function App() {
   // (Verint paste buffer, imported schedule grid) where each save is several hundred KB.
   useEffect(() => {
     if (!loaded) return;
+    let cancelled = false;
     const t = setTimeout(() => {
-      saveState(state);
+      saveState(state).then(() => {
+        if (!cancelled) setSaveWarning(null);
+      }).catch(err => {
+        if (!cancelled) setSaveWarning('Scenario auto-save failed: ' + (err && err.message ? err.message : 'browser storage error') + '. Use Save Scenario to download a safe copy before reloading.');
+      });
     }, 400);
-    return () => clearTimeout(t);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
   }, [state, loaded]);
 
   // Live link: when the volume source or its dependencies change, regenerate volume.
@@ -27843,7 +29568,7 @@ function App() {
     }
   }, [loaded, state.volumeUI && state.volumeUI.source, state.volumeUI && state.volumeUI.patternId, state.volumeUI && state.volumeUI.quickInput, state.volumeUI && state.volumeUI.weeklyTotal, state.volumeUI && state.volumeUI.dailyTotal, state.volumeUI && JSON.stringify(state.volumeUI.perDayTotals), state.volumeUI && state.volumeUI.shape, state.volumeUI && state.volumeUI.profile, state.volumeUI && JSON.stringify(state.volumeUI.overrides),
   // Stringify the active pattern only — avoids regenerating when an unrelated pattern is edited
-  state.volumeUI && state.patterns && state.patterns[state.volumeUI.patternId] && JSON.stringify(state.patterns[state.volumeUI.patternId]), state.config.deskStart, state.config.deskEnd]);
+  state.volumeUI && state.patterns && state.patterns[state.volumeUI.patternId] && JSON.stringify(state.patterns[state.volumeUI.patternId]), state.config.deskStart, state.config.deskEnd, JSON.stringify(state.config.dayHours || {})]);
   const scheduleResult = useMemo(() => buildFullSchedule(state), [state]);
   const grid = scheduleResult.grid;
   const trainingPlan = scheduleResult.plan;
@@ -28030,7 +29755,7 @@ function App() {
         setPanelEpoch(n => n + 1); // forces TrackerPanel / ReviewPanel to remount & reload
         const trackerSummary = incomingTracker && incomingTracker.imported ? incomingTracker.imported.length + ' tracker row' + (incomingTracker.imported.length === 1 ? '' : 's') : 'no tracker data';
         const reviewSummary = incomingReview && incomingReview.events ? incomingReview.events.length + ' review event' + (incomingReview.events.length === 1 ? '' : 's') : 'no review data';
-        alert('Scenario imported: "' + merged.name + '"\\n' + merged.agents.length + ' agents, ' + (merged.trainingSessions || []).length + ' diverted activit' + ((merged.trainingSessions || []).length === 1 ? 'y' : 'ies') + ', ' + Object.keys(merged.patterns || {}).length + ' pattern(s).\\n' + trackerSummary + ' · ' + reviewSummary);
+        alert('Scenario imported: "' + merged.name + '"\n' + merged.agents.length + ' agents, ' + (merged.trainingSessions || []).length + ' diverted activit' + ((merged.trainingSessions || []).length === 1 ? 'y' : 'ies') + ', ' + Object.keys(merged.patterns || {}).length + ' pattern(s).\n' + trackerSummary + ' · ' + reviewSummary);
       } catch (err) {
         alert('Could not import: ' + err.message);
       }
@@ -28157,7 +29882,19 @@ function App() {
       setLastSeenVersion(CURRENT_VERSION);
     },
     lastSeenVersion: lastSeenVersion
-  }), /*#__PURE__*/React.createElement("nav", {
+  }), saveWarning && /*#__PURE__*/React.createElement("div", {
+    role: "alert",
+    style: {
+      margin: '10px 20px 0',
+      padding: '10px 12px',
+      color: 'var(--bad)',
+      background: 'rgba(var(--bad-rgb), 0.08)',
+      border: '1px solid rgba(var(--bad-rgb), 0.35)',
+      borderRadius: '3px',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px'
+    }
+  }, "⚠ ", saveWarning), /*#__PURE__*/React.createElement("nav", {
     className: "tabs"
   }, /*#__PURE__*/React.createElement("button", {
     className: tab === 'config' ? 'active' : '',
@@ -28189,7 +29926,11 @@ function App() {
     className: tab === 'backoffice' ? 'active' : '',
     onClick: () => setTab('backoffice'),
     title: "For desks where agents split time between phones and admin work. Computes how much agent-time is left for back-office WIP after the call queue takes its share at target occupancy."
-  }, "Back Office"), /*#__PURE__*/React.createElement("div", {
+  }, "Back Office"), /*#__PURE__*/React.createElement("button", {
+    className: tab === 'rotation' ? 'active' : '',
+    onClick: () => setTab('rotation'),
+    title: "Simulate shift-rotation rule sets: who rotates, what the rules cost in burden and slack, and what they do to service level"
+  }, "Rotation"), /*#__PURE__*/React.createElement("div", {
     style: {
       flex: 1,
       borderBottom: '1px solid var(--line)'
@@ -28309,6 +30050,10 @@ function App() {
     state: state,
     setState: setState,
     grid: grid
+  }), tab === 'rotation' && /*#__PURE__*/React.createElement(RotationPanel, {
+    state: state,
+    setState: setState,
+    sla: sla
   }), visitedTabs.tracker && /*#__PURE__*/React.createElement("div", {
     style: {
       display: tab === 'tracker' ? 'block' : 'none'
@@ -28332,7 +30077,10 @@ function App() {
   })))));
 }
 const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(/*#__PURE__*/React.createElement(App, null));
+// Root-level boundary: render errors in App's own compute chain (buildFullSchedule /
+// computeSLA useMemos) or in any unwrapped panel previously escaped the per-tab
+// boundaries and blanked the whole app.
+root.render(/*#__PURE__*/React.createElement(ErrorBoundary, null, /*#__PURE__*/React.createElement(App, null)));
 </script>
 </body>
 </html>
