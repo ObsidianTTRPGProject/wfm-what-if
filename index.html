@@ -651,6 +651,23 @@ const LAST_SEEN_VERSION_KEY = 'wfm-last-seen-version';
 // `tag` is one of 'feat' (new feature), 'fix' (bug fix), 'change' (behaviour change),
 // 'ui' (visual/interaction tweak). Plain strings default to 'feat'.
 const CHANGELOG = [{
+  version: '0.40.1',
+  date: '2026-07-28',
+  title: 'Scenario hires now flow into imported-roster SLA',
+  changes: [{
+    tag: 'fix',
+    text: 'Agents added after a Verint import are now layered into the imported interval grid, so their rostered coverage immediately changes service level, shrinkage, training overlays, and schedule views instead of only increasing the displayed headcount.'
+  }, {
+    tag: 'feat',
+    text: 'New starters have a configurable productivity/ramp percentage. Set it while adding a cohort, edit individuals in the roster, or use Apply to Added to advance the entire cohort; fractional productivity feeds directly into effective Erlang staffing.'
+  }, {
+    tag: 'ui',
+    text: 'The Agents table groups and labels Verint staff separately from scenario-added staff, shows imported vs added headcount, supports duplicating an imported roster into a new scenario hire, and provides individual or bulk removal for added staff.'
+  }, {
+    tag: 'fix',
+    text: 'Scenario-added staff are preserved when switching or averaging imported weeks. Regression coverage verifies imported-grid layering and fractional ramp productivity.'
+  }]
+}, {
   version: '0.40.0',
   date: '2026-07-11',
   title: 'Simulation correctness and regression coverage',
@@ -5515,6 +5532,29 @@ function makeDefaultAgents(count) {
     };
   });
 }
+
+// Return the row in importedSchedule.grid that belongs to an agent, or -1 when the
+// agent was added manually for this scenario. New imports persist agentIds so this
+// remains correct even when scenario hires are grouped/reordered in the UI. Legacy
+// saved scenarios fall back to the original "first agentCount rows are imported"
+// convention.
+function importedRowIndexForAgent(state, agent, agentIdx) {
+  const imp = state && state.importedSchedule;
+  if (!imp || !imp.grid) return -1;
+  if (agent && agent.source === 'manual') return -1;
+  if (Array.isArray(imp.agentIds) && agent && agent.id != null) {
+    return imp.agentIds.indexOf(agent.id);
+  }
+  const importedCount = Math.min(+imp.agentCount || 0, imp.grid[0] ? imp.grid[0].length : 0);
+  return agentIdx >= 0 && agentIdx < importedCount ? agentIdx : -1;
+}
+function isScenarioAddedAgent(state, agent, agentIdx) {
+  return !!(state && state.importedSchedule && importedRowIndexForAgent(state, agent, agentIdx) < 0);
+}
+function agentProductivity(agent) {
+  const pct = agent && agent.productivityPct != null ? +agent.productivityPct : 100;
+  return Math.max(0, Math.min(100, isFinite(pct) ? pct : 100)) / 100;
+}
 const DEFAULT_STATE = {
   config: {
     deskStart: '07:00',
@@ -5606,7 +5646,8 @@ const DEFAULT_STATE = {
     agentBulk: {
       n: 1,
       start: '09:00',
-      end: '17:00'
+      end: '17:00',
+      productivityPct: 70
     },
     // Verint paste in AgentEditor — held until the user clicks Apply. Big blobs (the raw
     // CSV text) are kept too so the parser can re-run when the mapping changes.
@@ -7221,7 +7262,28 @@ function buildFullSchedule(state) {
   // This is the core flow when monitoring an in-flight roster: "given this real schedule,
   // what happens to SLA if I add a 2-hour training programme on Tuesday afternoon?"
   if (state.importedSchedule && state.importedSchedule.grid) {
-    const baseGrid = state.importedSchedule.grid;
+    const importedGrid = state.importedSchedule.grid;
+
+    // Imported rows cover only the people present in Verint. Scenario-added agents need
+    // their normal generated shift rows appended/aligned with state.agents; otherwise the
+    // headcount changes while availability (and therefore SLA) remains frozen. Building a
+    // combined base grid here also lets every downstream overlay (leave, training, schedule
+    // view, shrinkage and SLA) treat imported and scenario staff identically.
+    const baseGrid = [];
+    for (let d = 0; d < 7; d++) {
+      const dayRows = [];
+      for (let a = 0; a < agents.length; a++) {
+        const importedIdx = importedRowIndexForAgent(state, agents[a], a);
+        const importedRow = importedIdx >= 0 && importedGrid[d] && importedGrid[d][importedIdx];
+        if (importedRow) {
+          dayRows.push(importedRow);
+        } else {
+          const built = buildScheduleForAgent(state, agents[a], d, [], {});
+          dayRows.push(built.row);
+        }
+      }
+      baseGrid.push(dayRows);
+    }
 
     // Eligibility check for training placement, parameterised by `force`.
     //
@@ -7541,13 +7603,14 @@ function buildFullSchedule(state) {
     leave
   };
 }
-function computeAvailability(grid) {
+function computeAvailability(grid, agents) {
   const out = [];
   for (let d = 0; d < 7; d++) {
     const dayRow = new Array(INTERVALS_PER_DAY).fill(0);
     for (let a = 0; a < grid[d].length; a++) {
+      const productiveFTE = agents && agents[a] ? agentProductivity(agents[a]) : 1;
       for (let i = 0; i < INTERVALS_PER_DAY; i++) {
-        if (grid[d][a][i] === 'work') dayRow[i]++;
+        if (grid[d][a][i] === 'work') dayRow[i] += productiveFTE;
       }
     }
     out.push(dayRow);
@@ -7574,8 +7637,9 @@ function computePlannedAvailability(state, plan) {
       const {
         row
       } = buildScheduleForAgent(state, agent, d, tps, plan.placements[a] || {});
+      const productiveFTE = agentProductivity(agent);
       for (let i = 0; i < INTERVALS_PER_DAY; i++) {
-        if (row[i] === 'work') dayRow[i]++;
+        if (row[i] === 'work') dayRow[i] += productiveFTE;
       }
     }
     out.push(dayRow);
@@ -12963,6 +13027,7 @@ function AgentEditor({
   const bulkN = bulkUI.n != null ? bulkUI.n : 1;
   const bulkStart = bulkUI.start || '09:00';
   const bulkEnd = bulkUI.end || '17:00';
+  const bulkProductivityPct = bulkUI.productivityPct != null ? bulkUI.productivityPct : 70;
   const setBulkUI = patch => setState(prev => Object.assign({}, prev, {
     uiState: Object.assign({}, prev.uiState, {
       agentBulk: Object.assign({}, prev.uiState && prev.uiState.agentBulk || {}, patch)
@@ -12977,6 +13042,17 @@ function AgentEditor({
   const setBulkEnd = v => setBulkUI({
     end: v
   });
+  const setBulkProductivityPct = v => setBulkUI({
+    productivityPct: v
+  });
+  const applyProductivityToAdded = () => {
+    const pct = Math.max(0, Math.min(100, +bulkProductivityPct || 0));
+    setState(prev => Object.assign({}, prev, {
+      agents: prev.agents.map((a, i) => isScenarioAddedAgent(prev, a, i) ? Object.assign({}, a, {
+        productivityPct: pct
+      }) : a)
+    }));
+  };
 
   // Verint schedule import state (held until user reviews mapping and clicks Apply).
   // parsed: { kind, agents, grid, discoveredActivities, warnings, filename } | null
@@ -13040,7 +13116,9 @@ function AgentEditor({
       name: 'Agent ' + (state.agents.length + 1),
       shiftStart: '09:00',
       shiftEnd: '17:00',
-      workDays: [0, 1, 2, 3, 4]
+      workDays: [0, 1, 2, 3, 4],
+      source: state.importedSchedule ? 'manual' : 'configured',
+      productivityPct: state.importedSchedule ? bulkProductivityPct : 100
     }, template || {});
     setState(Object.assign({}, state, {
       agents: state.agents.concat([newAg]),
@@ -13063,10 +13141,12 @@ function AgentEditor({
     const id = nextId();
     const copy = Object.assign({}, src, {
       id,
-      name: src.name + ' copy'
+      name: src.name + ' copy',
+      source: state.importedSchedule ? 'manual' : src.source,
+      productivityPct: state.importedSchedule ? bulkProductivityPct : src.productivityPct
     });
-    const agents = state.agents.slice();
-    agents.splice(i + 1, 0, copy);
+    // Append scenario hires so imported-grid row order remains stable.
+    const agents = state.agents.concat([copy]);
     setState(Object.assign({}, state, {
       agents,
       config: Object.assign({}, state.config, {
@@ -13088,7 +13168,9 @@ function AgentEditor({
         name: 'Agent ' + (state.agents.length + k + 1),
         shiftStart: bulkStart,
         shiftEnd: bulkEnd,
-        workDays: [0, 1, 2, 3, 4]
+        workDays: [0, 1, 2, 3, 4],
+        source: state.importedSchedule ? 'manual' : 'configured',
+        productivityPct: state.importedSchedule ? bulkProductivityPct : 100
       });
     }
     const agents = state.agents.concat(newAgents);
@@ -13100,6 +13182,19 @@ function AgentEditor({
     }));
   };
   const clearAll = () => {
+    if (state.importedSchedule) {
+      const agents = state.agents.filter((a, i) => !isScenarioAddedAgent(state, a, i));
+      const removed = state.agents.length - agents.length;
+      if (removed === 0) return;
+      if (!confirm('Remove all ' + removed + ' scenario-added agent' + (removed === 1 ? '' : 's') + '?')) return;
+      setState(Object.assign({}, state, {
+        agents,
+        config: Object.assign({}, state.config, {
+          agentCount: agents.length
+        })
+      }));
+      return;
+    }
     if (!confirm('Remove all ' + state.agents.length + ' agents? This cannot be undone.')) return;
     setState(Object.assign({}, state, {
       agents: [],
@@ -13399,8 +13494,12 @@ function AgentEditor({
   // gets reset atomically with the data commit (one re-render instead of five).
   const applyVerintImport = () => {
     if (!verintParsed) return;
+    const importedAgents = verintParsed.agents.map(a => Object.assign({}, a, {
+      source: 'imported',
+      productivityPct: 100
+    }));
     setState(prev => Object.assign({}, prev, {
-      agents: verintParsed.agents,
+      agents: importedAgents,
       importedSchedule: {
         grid: verintParsed.grid,
         source: 'verint',
@@ -13408,6 +13507,7 @@ function AgentEditor({
         filename: verintFilename,
         importedAt: new Date().toISOString(),
         agentCount: verintParsed.agents.length,
+        agentIds: importedAgents.map(a => a.id),
         // Persist the raw export text + the list of discovered activities so the mapping
         // can be reviewed and re-applied AFTER import (for troubleshooting categorisation).
         // The raw text lets us re-run parseVerintSchedule with an edited mapping and rebuild
@@ -13531,16 +13631,23 @@ function AgentEditor({
       const reparsed = parseVerintSchedule(imp.rawText, state.activityMapping || {}, {
         weekStartIso
       });
+      const importedAgents = reparsed.agents.map(a => Object.assign({}, a, {
+        source: 'imported',
+        productivityPct: 100
+      }));
+      const scenarioAgents = state.agents.filter((a, i) => isScenarioAddedAgent(state, a, i));
+      const agents = importedAgents.concat(scenarioAgents);
       setState(Object.assign({}, state, {
-        agents: reparsed.agents,
+        agents,
         config: Object.assign({}, state.config, {
-          agentCount: reparsed.agents.length,
+          agentCount: agents.length,
           dayHours: deriveDayHoursFromGrid(reparsed.grid)
         }),
         plannedLeave: [],
         importedSchedule: Object.assign({}, imp, {
           grid: reparsed.grid,
           agentCount: reparsed.agents.length,
+          agentIds: importedAgents.map(a => a.id),
           selectedWeekIso: reparsed.selectedWeekIso,
           discoveredActivities: Array.from(reparsed.discoveredActivities || imp.discoveredActivities || [])
         })
@@ -13592,16 +13699,22 @@ function AgentEditor({
       }
       // Pad/trim the agent reference list to the synthetic grid's row count so agentCount lines up.
       const rowCount = avgGrid[0] ? avgGrid[0].length : agentsRef ? agentsRef.length : 0;
-      const agents = [];
+      const importedAgents = [];
       for (let a = 0; a < rowCount; a++) {
-        agents.push(agentsRef && agentsRef[a] ? agentsRef[a] : {
+        const baseAgent = agentsRef && agentsRef[a] ? agentsRef[a] : {
           id: 'AVG' + a,
           name: 'Avg agent ' + (a + 1),
           workDays: [0, 1, 2, 3, 4],
           shiftStart: '09:00',
           shiftEnd: '17:00'
-        });
+        };
+        importedAgents.push(Object.assign({}, baseAgent, {
+          source: 'imported',
+          productivityPct: 100
+        }));
       }
+      const scenarioAgents = state.agents.filter((a, i) => isScenarioAddedAgent(state, a, i));
+      const agents = importedAgents.concat(scenarioAgents);
       setState(Object.assign({}, state, {
         agents,
         config: Object.assign({}, state.config, {
@@ -13615,7 +13728,8 @@ function AgentEditor({
         }),
         importedSchedule: Object.assign({}, imp, {
           grid: avgGrid,
-          agentCount: agents.length,
+          agentCount: importedAgents.length,
+          agentIds: importedAgents.map(a => a.id),
           combineMode: 'average',
           averagedWeeks: isos,
           selectedWeekIso: null,
@@ -13698,6 +13812,8 @@ function AgentEditor({
   // ---------------------------------------------------------------------------
   const weeklyFTEHours = +state.config.weeklyFTEHours || 38;
   const totalHeadcount = state.agents.length;
+  const scenarioAddedCount = state.importedSchedule ? state.agents.filter((a, i) => isScenarioAddedAgent(state, a, i)).length : 0;
+  const importedHeadcount = state.importedSchedule ? totalHeadcount - scenarioAddedCount : 0;
   const perDayCount = new Array(7).fill(0);
   const perDayHours = new Array(7).fill(0);
   let totalWeeklyHours = 0;
@@ -13725,6 +13841,17 @@ function AgentEditor({
         }
         if (cellsOn >= ON_DUTY_THRESHOLD_CELLS) perDayCount[d]++;
         perDayHours[d] += cellsOn * 0.25;
+      }
+    }
+    // The imported grid has no rows for scenario-added staff. Include their configured
+    // rosters in the summary just as buildFullSchedule does for SLA.
+    for (let a = 0; a < state.agents.length; a++) {
+      if (!isScenarioAddedAgent(state, state.agents[a], a)) continue;
+      for (let d = 0; d < 7; d++) {
+        const segs = getAgentWorkingIntervals(state.agents[a], d);
+        if (segs.length === 0) continue;
+        perDayCount[d]++;
+        for (const seg of segs) perDayHours[d] += (seg.end - seg.start) * 0.25;
       }
     }
     totalWeeklyHours = perDayHours.reduce((s, h) => s + h, 0);
@@ -13802,7 +13929,12 @@ function AgentEditor({
       color: 'var(--ink-dim)',
       marginTop: '2px'
     }
-  }, totalWeeklyHours.toFixed(1), " hrs/wk · ", totalWeeklyFTE.toFixed(2), " FTE", /*#__PURE__*/React.createElement("span", {
+  }, totalWeeklyHours.toFixed(1), " hrs/wk · ", totalWeeklyFTE.toFixed(2), " FTE", state.importedSchedule && /*#__PURE__*/React.createElement("span", {
+    style: {
+      marginLeft: '6px',
+      color: scenarioAddedCount > 0 ? 'var(--accent)' : 'var(--ink-faint)'
+    }
+  }, "(", importedHeadcount, " imported + ", scenarioAddedCount, " added)"), /*#__PURE__*/React.createElement("span", {
     title: 'FTE = total weekly hours ÷ ' + weeklyFTEHours + 'h. Adjust weeklyFTEHours in Config if your standard week differs.',
     style: {
       marginLeft: '4px',
@@ -13904,7 +14036,7 @@ function AgentEditor({
       color: 'var(--ink-dim)',
       lineHeight: 1.6
     }
-  }, "The current schedule is driven by your Verint import. Per-interval activities (work, breaks, leave, downtime, diverted activities) come directly from the file — the tool's schedule generator is bypassed.", state.importedSchedule.kind === 'startend' && /*#__PURE__*/React.createElement("span", null, " Since this is a start/end-only import, the schedule shows agents as \"work\" during their shift windows. To get detailed activity codes (breaks, leave, downtime etc.), re-import using the Activities export from Verint.")), /*#__PURE__*/React.createElement("div", {
+  }, "The current baseline is driven by your Verint import. Its per-interval activities (work, breaks, leave, downtime and diverted activities) come directly from the file. Scenario-added agents are layered on top using the shifts and ramp productivity configured below.", state.importedSchedule.kind === 'startend' && /*#__PURE__*/React.createElement("span", null, " Since this is a start/end-only import, the schedule shows agents as \"work\" during their shift windows. To get detailed activity codes (breaks, leave, downtime etc.), re-import using the Activities export from Verint.")), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: '10px',
       display: 'flex',
@@ -14610,7 +14742,7 @@ function AgentEditor({
       fontSize: '10px',
       color: 'var(--ink-faint)'
     }
-  }, "Note: applying will replace your current agent list and bypass the schedule generator. Planned leave entries will be cleared (the import already encodes leave). Diverted activities defined in the Diverted tab will be ", /*#__PURE__*/React.createElement("em", null, "layered on top"), " of the imported schedule — for each placement the tool checks whether agents are on-queue at that time and skips those who aren't."))), /*#__PURE__*/React.createElement("div", {
+  }, "Note: applying will replace your current agent list with the imported baseline. Planned leave entries will be cleared (the import already encodes leave). Agents you add afterward, plus diverted activities defined in the Diverted tab, will be ", /*#__PURE__*/React.createElement("em", null, "layered on top"), " of the imported schedule and included in SLA."))), /*#__PURE__*/React.createElement("div", {
     className: "panel"
   }, /*#__PURE__*/React.createElement("div", {
     className: "panel-h"
@@ -14663,7 +14795,26 @@ function AgentEditor({
     style: {
       width: '100px'
     }
-  })), /*#__PURE__*/React.createElement("button", {
+  })), state.importedSchedule && /*#__PURE__*/React.createElement("label", {
+    className: "field",
+    style: {
+      margin: 0
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "Productivity / ramp %"), /*#__PURE__*/React.createElement(NumberInput, {
+    min: 0,
+    max: 100,
+    value: bulkProductivityPct,
+    onChange: setBulkProductivityPct,
+    fallback: 70,
+    style: {
+      width: '90px'
+    },
+    title: "Effective on-queue contribution. For example, 70% means each new person contributes 0.7 productive FTE while ramping."
+  })), state.importedSchedule && scenarioAddedCount > 0 && /*#__PURE__*/React.createElement("button", {
+    className: "btn sm ghost",
+    onClick: applyProductivityToAdded,
+    title: "Set every scenario-added agent to the productivity percentage shown"
+  }, "Apply to Added"), /*#__PURE__*/React.createElement("button", {
     className: "btn",
     onClick: addBulk
   }, "+ Add ", bulkN > 1 ? bulkN + ' Agents' : 'Agent'), /*#__PURE__*/React.createElement("button", {
@@ -14699,10 +14850,22 @@ function AgentEditor({
       marginLeft: 'auto'
     },
     title: "Distributes workdays and shift times to balance Erlang-required coverage across all days with volume"
-  }, "Auto-balance coverage"), state.agents.length > 0 && /*#__PURE__*/React.createElement("button", {
+  }, "Auto-balance coverage"), (state.importedSchedule ? scenarioAddedCount > 0 : state.agents.length > 0) && /*#__PURE__*/React.createElement("button", {
     className: "btn sm danger",
     onClick: clearAll
-  }, "Remove All")))), /*#__PURE__*/React.createElement("div", {
+  }, state.importedSchedule ? "Remove Added" : "Remove All")), state.importedSchedule && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: '10px',
+      padding: '8px 10px',
+      background: 'rgba(var(--accent-rgb), 0.07)',
+      border: '1px solid rgba(var(--accent-rgb), 0.25)',
+      borderRadius: '3px',
+      fontFamily: 'var(--mono)',
+      fontSize: '10px',
+      color: 'var(--ink-dim)',
+      lineHeight: 1.5
+    }
+  }, "Scenario-added agents are layered on top of the Verint schedule and flow into SLA immediately. Productivity converts each on-queue interval into effective capacity while a new starter ramps (70% = 0.7 productive FTE). Duplicate an imported roster below to add a matching shift pattern."))), /*#__PURE__*/React.createElement("div", {
     className: "panel"
   }, /*#__PURE__*/React.createElement("div", {
     className: "panel-h"
@@ -14736,6 +14899,11 @@ function AgentEditor({
         }
       }
     }
+    const displayAgents = state.agents.map((a, i) => ({
+      a,
+      i,
+      scenarioAdded: isScenarioAddedAgent(state, a, i)
+    })).sort((x, y) => Number(x.scenarioAdded) - Number(y.scenarioAdded));
     return /*#__PURE__*/React.createElement(Fragment, null, minRest > 0 && /*#__PURE__*/React.createElement("div", {
       style: {
         padding: '10px 14px',
@@ -14752,9 +14920,25 @@ function AgentEditor({
       style: {
         color: 'var(--bad)'
       }
-    }, "⚠ EA rest violations · ", Object.keys(violations).length, " agent", Object.keys(violations).length === 1 ? '' : 's', " with ", totalViolations, " short break", totalViolations === 1 ? '' : 's', " (under ", minRest, "h)")), /*#__PURE__*/React.createElement("table", {
+    }, "⚠ EA rest violations · ", Object.keys(violations).length, " agent", Object.keys(violations).length === 1 ? '' : 's', " with ", totalViolations, " short break", totalViolations === 1 ? '' : 's', " (under ", minRest, "h)")), state.importedSchedule && /*#__PURE__*/React.createElement("div", {
+      style: {
+        padding: '8px 14px',
+        borderBottom: '1px solid var(--line)',
+        fontFamily: 'var(--mono)',
+        fontSize: '10px',
+        color: 'var(--ink-dim)'
+      }
+    }, /*#__PURE__*/React.createElement("strong", {
+      style: {
+        color: 'var(--ink)'
+      }
+    }, importedHeadcount, " imported"), " · ", /*#__PURE__*/React.createElement("strong", {
+      style: {
+        color: 'var(--accent)'
+      }
+    }, scenarioAddedCount, " scenario-added"), " · rows are grouped by source below"), /*#__PURE__*/React.createElement("table", {
       className: "data"
-    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "ID"), /*#__PURE__*/React.createElement("th", null, "Name"), /*#__PURE__*/React.createElement("th", null, "Start"), /*#__PURE__*/React.createElement("th", null, "End"), DAYS.map(d => /*#__PURE__*/React.createElement("th", {
+    }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, state.importedSchedule && /*#__PURE__*/React.createElement("th", null, "Source"), /*#__PURE__*/React.createElement("th", null, "ID"), /*#__PURE__*/React.createElement("th", null, "Name"), /*#__PURE__*/React.createElement("th", null, "Start"), /*#__PURE__*/React.createElement("th", null, "End"), state.importedSchedule && /*#__PURE__*/React.createElement("th", null, "Productivity"), DAYS.map(d => /*#__PURE__*/React.createElement("th", {
       key: d,
       style: {
         textAlign: 'center'
@@ -14763,7 +14947,11 @@ function AgentEditor({
       style: {
         textAlign: 'right'
       }
-    }, "Actions"))), /*#__PURE__*/React.createElement("tbody", null, state.agents.map((a, i) => {
+    }, "Actions"))), /*#__PURE__*/React.createElement("tbody", null, displayAgents.map(({
+      a,
+      i,
+      scenarioAdded
+    }) => {
       const vs = violations[a.id] || [];
       const hasViolation = vs.length > 0;
       // Build a tooltip listing each violation
@@ -14774,8 +14962,19 @@ function AgentEditor({
         key: a.id,
         style: hasViolation ? {
           background: 'rgba(var(--bad-rgb), 0.04)'
+        } : scenarioAdded ? {
+          background: 'rgba(var(--accent-rgb), 0.05)'
         } : null
-      }, /*#__PURE__*/React.createElement("td", null, a.id), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("input", {
+      }, state.importedSchedule && /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: scenarioAdded ? 'var(--accent)' : 'var(--ink-faint)',
+          fontFamily: 'var(--mono)',
+          fontSize: '9px',
+          textTransform: 'uppercase',
+          letterSpacing: '0.08em',
+          whiteSpace: 'nowrap'
+        }
+      }, scenarioAdded ? "Scenario add" : "Verint")), /*#__PURE__*/React.createElement("td", null, a.id), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("input", {
         value: a.name,
         onChange: e => update(i, 'name', e.target.value),
         style: {
@@ -14810,7 +15009,25 @@ function AgentEditor({
           fontSize: '11px',
           width: '95px'
         }
-      })), DAYS.map((d, di) => /*#__PURE__*/React.createElement("td", {
+      })), state.importedSchedule && /*#__PURE__*/React.createElement("td", null, scenarioAdded ? /*#__PURE__*/React.createElement(NumberInput, {
+        min: 0,
+        max: 100,
+        value: a.productivityPct != null ? a.productivityPct : 100,
+        onChange: v => update(i, 'productivityPct', v),
+        fallback: 100,
+        style: {
+          padding: '2px 6px',
+          fontSize: '11px',
+          width: '72px'
+        },
+        title: "Effective productive contribution while this person ramps"
+      }) : /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: 'var(--ink-faint)',
+          fontFamily: 'var(--mono)',
+          fontSize: '10px'
+        }
+      }, "100%")), DAYS.map((d, di) => /*#__PURE__*/React.createElement("td", {
         key: d,
         style: {
           textAlign: 'center'
@@ -14834,7 +15051,8 @@ function AgentEditor({
       }, "⧉"), /*#__PURE__*/React.createElement("button", {
         className: "btn sm danger",
         onClick: () => removeAgent(i),
-        title: "Remove this agent"
+        disabled: state.importedSchedule && !scenarioAdded,
+        title: state.importedSchedule && !scenarioAdded ? "Imported agents are removed by resetting or replacing the Verint import" : "Remove this agent"
       }, "✕")));
     }))));
   })())));
@@ -22346,10 +22564,10 @@ function ShrinkagePanel({
     const plusLeaveSchedule = buildFullSchedule(plusLeaveState);
     const plusTrainSchedule = buildFullSchedule(plusTrainState);
     const currentSchedule = buildFullSchedule(currentState);
-    const idealAvail = computeAvailability(idealSchedule.grid);
-    const plusLeaveAvail = computeAvailability(plusLeaveSchedule.grid);
-    const plusTrainAvail = computeAvailability(plusTrainSchedule.grid);
-    const currentAvail = computeAvailability(currentSchedule.grid);
+    const idealAvail = computeAvailability(idealSchedule.grid, idealState.agents);
+    const plusLeaveAvail = computeAvailability(plusLeaveSchedule.grid, plusLeaveState.agents);
+    const plusTrainAvail = computeAvailability(plusTrainSchedule.grid, plusTrainState.agents);
+    const currentAvail = computeAvailability(currentSchedule.grid, currentState.agents);
     return {
       idealSLA: computeSLA(debouncedState.volume, idealAvail, idealState.config),
       plusLeaveSLA: computeSLA(debouncedState.volume, plusLeaveAvail, plusLeaveState.config),
@@ -29590,7 +29808,7 @@ function App() {
     }
     return [count, agents];
   }, [state.agents, state.config.minRestHours]);
-  const availability = useMemo(() => computeAvailability(grid), [grid]);
+  const availability = useMemo(() => computeAvailability(grid, state.agents), [grid, state.agents]);
   const plannedAvailability = useMemo(() => computePlannedAvailability(state, trainingPlan), [state, trainingPlan]);
   const sla = useMemo(() => computeSLA(state.volume, availability, state.config), [state.volume, availability, state.config]);
   const dailyMetrics = useMemo(() => computeDailyMetrics(sla, state.config), [sla, state.config]);

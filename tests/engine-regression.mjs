@@ -61,6 +61,51 @@ assert.equal(mixedCells.filter(x => x === 'break').length, 48, '50% break must b
 const halfPresent = averageGrids([mkGrid('work'), mkGrid('off')]);
 assert.equal(halfPresent[0][0].filter(x => x === 'work').length, 48, '0.5 average staffing must remain 0.5 over time');
 
+// Scenario-added staff must be layered onto an imported Verint grid and their ramp
+// productivity must flow through as fractional effective capacity.
+const importedPlusHire = cloneDefault();
+importedPlusHire.config.includeBreaks = false;
+importedPlusHire.config.includeLunch = false;
+importedPlusHire.config.downtimePct = 0;
+importedPlusHire.agents = [{
+  id: 'V1',
+  name: 'Verint agent',
+  shiftStart: '09:00',
+  shiftEnd: '10:00',
+  workDays: [0],
+  source: 'imported',
+  productivityPct: 100
+}, {
+  id: 'M1',
+  name: 'New starter',
+  shiftStart: '09:00',
+  shiftEnd: '10:00',
+  workDays: [0],
+  source: 'manual',
+  productivityPct: 50
+}];
+const importedGrid = Array.from({ length: 7 }, (_, d) => {
+  const row = new Array(96).fill('off');
+  if (d === 0) for (let i = 36; i < 40; i++) row[i] = 'work';
+  return [row];
+});
+importedPlusHire.importedSchedule = {
+  grid: importedGrid,
+  source: 'verint',
+  agentCount: 1,
+  agentIds: ['V1']
+};
+const buildFullSchedule = get('buildFullSchedule');
+const computeAvailability = get('computeAvailability');
+const combinedSchedule = buildFullSchedule(importedPlusHire);
+assert.equal(combinedSchedule.grid[0].length, 2, 'manual hires must receive rows alongside the imported grid');
+assert.equal(combinedSchedule.grid[0][1][36], 'work', 'manual hire roster must be generated on top of Verint');
+const combinedAvailability = computeAvailability(combinedSchedule.grid, importedPlusHire.agents);
+assert.equal(combinedAvailability[0][36], 1.5, '50% ramp productivity must contribute 0.5 effective agent to SLA');
+importedPlusHire.agents[1].productivityPct = 100;
+const fullRampAvailability = computeAvailability(combinedSchedule.grid, importedPlusHire.agents);
+assert.equal(fullRampAvailability[0][36], 2, 'raising productivity must immediately raise effective SLA staffing');
+
 const erlangA = get('erlangA');
 const eaLo = erlangA(9.49, 30, 300, 90, 20, 900);
 const eaHi = erlangA(9.50, 30, 300, 90, 20, 900);
