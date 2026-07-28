@@ -651,6 +651,23 @@ const LAST_SEEN_VERSION_KEY = 'wfm-last-seen-version';
 // `tag` is one of 'feat' (new feature), 'fix' (bug fix), 'change' (behaviour change),
 // 'ui' (visual/interaction tweak). Plain strings default to 'feat'.
 const CHANGELOG = [{
+  version: '0.40.2',
+  date: '2026-07-28',
+  title: 'Privacy-safe Verint schedule imports',
+  changes: [{
+    tag: 'feat',
+    text: 'Verint employee names are discarded at the import boundary and replaced deterministically with Verint-Import-01, Verint-Import-02, and so on. Real names never enter the displayed roster or persisted scenario state.'
+  }, {
+    tag: 'fix',
+    text: 'The retained Verint CSV used for activity re-mapping and multi-week switching is anonymised too, and potentially identifying local filenames are replaced with a generic Verint schedule import label.'
+  }, {
+    tag: 'fix',
+    text: 'Older saved scenarios are privacy-migrated when loaded: imported agent names, retained raw schedules, unfinished import previews, and stored filenames are scrubbed while manually added staff names remain unchanged.'
+  }, {
+    tag: 'change',
+    text: 'All Verint schedule parser entry points now enforce anonymisation centrally. Regression coverage includes quoted names, repeated activity rows, stable placeholders, legacy-state migration, and filename removal.'
+  }]
+}, {
   version: '0.40.1',
   date: '2026-07-28',
   title: 'Scenario hires now flow into imported-roster SLA',
@@ -5555,6 +5572,53 @@ function agentProductivity(agent) {
   const pct = agent && agent.productivityPct != null ? +agent.productivityPct : 100;
   return Math.max(0, Math.min(100, isFinite(pct) ? pct : 100)) / 100;
 }
+
+// Privacy migration for scenarios created before Verint-name redaction existed. Imported
+// agents are renamed in-place-by-copy, and any retained raw import (including an unfinished
+// import preview in uiState) is rewritten with placeholders before the scenario is rendered
+// or auto-saved again. Scenario-added staff keep their user-entered names.
+function anonymizeImportedScheduleState(state) {
+  if (!state) return state;
+  let next = state;
+  const imp = state.importedSchedule;
+  if (imp && imp.grid) {
+    const agents = (state.agents || []).map((agent, i) => {
+      const importedIdx = importedRowIndexForAgent(state, agent, i);
+      if (importedIdx < 0) return agent;
+      const safeName = 'Verint-Import-' + String(importedIdx + 1).padStart(2, '0');
+      return agent.name === safeName ? agent : Object.assign({}, agent, {
+        name: safeName
+      });
+    });
+    const safeRawText = typeof imp.rawText === 'string' ? redactVerintScheduleText(imp.rawText) : imp.rawText;
+    next = Object.assign({}, next, {
+      agents,
+      importedSchedule: Object.assign({}, imp, {
+        rawText: safeRawText,
+        filename: 'Verint schedule import'
+      })
+    });
+  }
+  const verintUI = next.uiState && next.uiState.verint;
+  if (verintUI && typeof verintUI.rawText === 'string' && verintUI.rawText) {
+    const safeRawText = redactVerintScheduleText(verintUI.rawText);
+    const safeParsed = verintUI.parsed && Array.isArray(verintUI.parsed.agents) ? Object.assign({}, verintUI.parsed, {
+      agents: verintUI.parsed.agents.map((agent, i) => Object.assign({}, agent, {
+        name: 'Verint-Import-' + String(i + 1).padStart(2, '0')
+      }))
+    }) : verintUI.parsed;
+    next = Object.assign({}, next, {
+      uiState: Object.assign({}, next.uiState, {
+        verint: Object.assign({}, verintUI, {
+          rawText: safeRawText,
+          parsed: safeParsed,
+          filename: 'Verint schedule import'
+        })
+      })
+    });
+  }
+  return next;
+}
 const DEFAULT_STATE = {
   config: {
     deskStart: '07:00',
@@ -9883,6 +9947,48 @@ function detectVerintFormat(text) {
   return null;
 }
 
+// Rewrite the employee-name column before Verint data enters parser output or persisted
+// application state. The placeholder assignment is deterministic by first appearance, so
+// the same person keeps the same identifier across days and multi-week files.
+function redactVerintScheduleText(text) {
+  const source = String(text || '');
+  const fmt = detectVerintFormat(source);
+  if (!fmt) return source;
+  const lines = source.split(/\r?\n/);
+  let headerIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^Name,/.test(lines[i]) && (fmt !== 'activities' || lines[i].includes('Shift Events'))) {
+      headerIdx = i;
+      break;
+    }
+  }
+  if (headerIdx < 0) return source;
+  const placeholders = new Map();
+  let inDateSection = fmt === 'startend';
+  const csvCell = value => {
+    const s = String(value == null ? '' : value);
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const trimmed = (lines[i] || '').trim();
+    if (!trimmed) continue;
+    if (fmt === 'activities' && /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(trimmed)) {
+      inDateSection = true;
+      continue;
+    }
+    if (!inDateSection) continue;
+    const fields = parseVerintCsvRow(lines[i]);
+    if (fields.length < 2 || !fields[0].trim()) continue;
+    const originalName = fields[0].trim();
+    if (!placeholders.has(originalName)) {
+      placeholders.set(originalName, 'Verint-Import-' + String(placeholders.size + 1).padStart(2, '0'));
+    }
+    fields[0] = placeholders.get(originalName);
+    lines[i] = fields.map(csvCell).join(',');
+  }
+  return lines.join('\n');
+}
+
 // Default mapping rules for Verint activity names → internal buckets.
 // Buckets: 'inbound' | 'downtime' | 'planned_leave' | 'unplanned_leave' | 'diverted'
 //          | 'off' | 'break' | 'lunch'
@@ -9971,6 +10077,10 @@ function bucketToGridCode(bucket) {
 // single 7-day grid — different weeks' Mondays overwriting each other — so week isolation is
 // mandatory for correctness.
 function parseVerintSchedule(text, activityMapping, opts) {
+  // Defence in depth: every caller receives anonymised agents and warnings even if it
+  // forgets to redact at the file-input boundary. Callers that retain raw text must store
+  // redactVerintScheduleText(text), never the original upload.
+  text = redactVerintScheduleText(text);
   const fmt = detectVerintFormat(text);
   if (!fmt) {
     throw new Error('Could not detect Verint file format. Expected a header row with "Shift Events" (activities export) or dated day columns (start/end export).');
@@ -13429,9 +13539,12 @@ function AgentEditor({
     fr.onload = ev => {
       const text = ev.target.result;
       try {
+        // Redact before parsing or writing anything into React/application storage. The
+        // FileReader result is the only short-lived reference to the original names.
+        const safeText = redactVerintScheduleText(text);
         // First pass: parse with empty mapping so the parser uses default buckets and we
         // can see what activities exist. We'll build the mapping object from those defaults.
-        const parsed = parseVerintSchedule(text, {});
+        const parsed = parseVerintSchedule(safeText, {});
         // Seed the mapping with the parser's default bucket for each discovered activity.
         // Assignment-column names default to 'inbound' (base shift window is on-queue);
         // event names use the regular activity-name defaults.
@@ -13447,8 +13560,9 @@ function AgentEditor({
         }
         setVerintParsed(parsed);
         setVerintMapping(seedMapping);
-        setVerintRawText(text);
-        setVerintFilename(file.name || '');
+        setVerintRawText(safeText);
+        // Do not retain the local filename either; it may itself contain an employee name.
+        setVerintFilename('Verint schedule import');
       } catch (err) {
         alert('Could not parse Verint file:\n\n' + err.message);
       }
@@ -14036,7 +14150,7 @@ function AgentEditor({
       color: 'var(--ink-dim)',
       lineHeight: 1.6
     }
-  }, "The current baseline is driven by your Verint import. Its per-interval activities (work, breaks, leave, downtime and diverted activities) come directly from the file. Scenario-added agents are layered on top using the shifts and ramp productivity configured below.", state.importedSchedule.kind === 'startend' && /*#__PURE__*/React.createElement("span", null, " Since this is a start/end-only import, the schedule shows agents as \"work\" during their shift windows. To get detailed activity codes (breaks, leave, downtime etc.), re-import using the Activities export from Verint.")), /*#__PURE__*/React.createElement("div", {
+  }, "The current baseline is driven by your Verint import. Employee names were removed at import and replaced with Verint-Import placeholders; the retained data used for week switching and re-mapping is anonymised too. Per-interval activities (work, breaks, leave, downtime and diverted activities) come directly from the file. Scenario-added agents are layered on top using the shifts and ramp productivity configured below.", state.importedSchedule.kind === 'startend' && /*#__PURE__*/React.createElement("span", null, " Since this is a start/end-only import, the schedule shows agents as \"work\" during their shift windows. To get detailed activity codes (breaks, leave, downtime etc.), re-import using the Activities export from Verint.")), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: '10px',
       display: 'flex',
@@ -14742,7 +14856,7 @@ function AgentEditor({
       fontSize: '10px',
       color: 'var(--ink-faint)'
     }
-  }, "Note: applying will replace your current agent list with the imported baseline. Planned leave entries will be cleared (the import already encodes leave). Agents you add afterward, plus diverted activities defined in the Diverted tab, will be ", /*#__PURE__*/React.createElement("em", null, "layered on top"), " of the imported schedule and included in SLA."))), /*#__PURE__*/React.createElement("div", {
+  }, "Privacy: employee names have already been discarded and replaced with Verint-Import-01, Verint-Import-02, etc. Applying will replace your current agent list with this anonymised baseline. Planned leave entries will be cleared (the import already encodes leave). Agents you add afterward, plus diverted activities defined in the Diverted tab, will be ", /*#__PURE__*/React.createElement("em", null, "layered on top"), " of the imported schedule and included in SLA."))), /*#__PURE__*/React.createElement("div", {
     className: "panel"
   }, /*#__PURE__*/React.createElement("div", {
     className: "panel-h"
@@ -25051,9 +25165,10 @@ function ReviewPanel({
     });
     try {
       const text = await file.text();
-      const fmt = detectVerintFormat(text);
+      const safeText = redactVerintScheduleText(text);
+      const fmt = detectVerintFormat(safeText);
       if (!fmt) throw new Error('Could not detect Verint schedule format (expected "Shift Events" or "Start Date" header).');
-      const parsed = parseVerintSchedule(text);
+      const parsed = parseVerintSchedule(safeText);
       if (!parsed.agents || !parsed.agents.length) throw new Error('No agents parsed from schedule');
 
       // The parser now returns dayDates directly — 7 ISO dates spanning the schedule's Mon-Sun
@@ -25064,7 +25179,8 @@ function ReviewPanel({
       setData(prev => {
         const next = Object.assign({}, prev, {
           schedule: parsed,
-          scheduleFilename: file.name,
+          // File names can contain employee identifiers, so retain only a generic label.
+          scheduleFilename: 'Verint schedule import',
           scheduleDayDates
         });
         next.nameMapping = recomputeMapping(prev.events, parsed);
@@ -29738,11 +29854,14 @@ function App() {
       // older version may miss newer fields (trainingSessions, patterns, config keys...)
       // and applying it raw crashes buildFullSchedule during render — an unrecoverable
       // black screen, because the same bad state re-loads on every refresh.
-      if (s) setState(Object.assign({}, DEFAULT_STATE, s, {
-        config: Object.assign({}, DEFAULT_STATE.config, s.config),
-        patterns: s.patterns || {},
-        trainingSessions: s.trainingSessions || []
-      }));
+      if (s) {
+        const merged = Object.assign({}, DEFAULT_STATE, s, {
+          config: Object.assign({}, DEFAULT_STATE.config, s.config),
+          patterns: s.patterns || {},
+          trainingSessions: s.trainingSessions || []
+        });
+        setState(anonymizeImportedScheduleState(merged));
+      }
       setLoaded(true);
     });
   }, []);
@@ -29938,11 +30057,11 @@ function App() {
           incoming.name = stripped.replace(/_/g, ' ').trim() || baseName;
         }
         // Backfill defaults for newer fields older exports might miss
-        const merged = Object.assign({}, DEFAULT_STATE, incoming, {
+        const merged = anonymizeImportedScheduleState(Object.assign({}, DEFAULT_STATE, incoming, {
           config: Object.assign({}, DEFAULT_STATE.config, incoming.config),
           patterns: incoming.patterns || {},
           trainingSessions: incoming.trainingSessions || []
-        });
+        }));
         // Two-tier persistence on import: write to the App-level refs (always succeeds,
         // no size limit) AND to window.storage (for cross-page-reload persistence; may
         // silently fail on 5MB cap). Panels read from the ref first on mount; storage is

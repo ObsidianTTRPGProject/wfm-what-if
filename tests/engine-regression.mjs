@@ -61,6 +61,66 @@ assert.equal(mixedCells.filter(x => x === 'break').length, 48, '50% break must b
 const halfPresent = averageGrids([mkGrid('work'), mkGrid('off')]);
 assert.equal(halfPresent[0][0].filter(x => x === 'work').length, 48, '0.5 average staffing must remain 0.5 over time');
 
+// Verint employee names must be removed before parser output or retained raw import text
+// enters application state. Quoted names and repeated multi-day rows keep stable placeholders.
+const redactVerintScheduleText = get('redactVerintScheduleText');
+const parseVerintSchedule = get('parseVerintSchedule');
+const startEndWithNames = [
+  'Name,Start Date,27/07/2026,28/07/2026',
+  '"Jane, Doe",27/07/2026,Standard 27/07/2026 9:00 AM-27/07/2026 5:00 PM,Standard 28/07/2026 9:00 AM-28/07/2026 5:00 PM',
+  'John Smith,27/07/2026,Early 27/07/2026 8:00 AM-27/07/2026 4:00 PM,Early 28/07/2026 8:00 AM-28/07/2026 4:00 PM'
+].join('\n');
+const redactedStartEnd = redactVerintScheduleText(startEndWithNames);
+assert.ok(!redactedStartEnd.includes('Jane'), 'quoted Verint names must not survive retained raw text');
+assert.ok(!redactedStartEnd.includes('John Smith'), 'plain Verint names must not survive retained raw text');
+assert.match(redactedStartEnd, /Verint-Import-01/);
+assert.match(redactedStartEnd, /Verint-Import-02/);
+const parsedRedactedStartEnd = parseVerintSchedule(startEndWithNames);
+assert.deepEqual(Array.from(parsedRedactedStartEnd.agents, a => a.name), ['Verint-Import-01', 'Verint-Import-02']);
+
+const activitiesWithNames = [
+  'Name,Scheduled SP Draft Hours,Start Date,Scheduling Period,Before Overtime,After Overtime,Shift Assignment,Shift Events',
+  '27/07/2026',
+  'Jane Doe,,,,,,Standard 27/07/2026 9:00 AM-27/07/2026 5:00 PM,',
+  '28/07/2026',
+  'Jane Doe,,,,,,Standard 28/07/2026 9:00 AM-28/07/2026 5:00 PM,',
+  'John Smith,,,,,,Early 28/07/2026 8:00 AM-28/07/2026 4:00 PM,'
+].join('\n');
+const redactedActivities = redactVerintScheduleText(activitiesWithNames);
+assert.ok(!redactedActivities.includes('Jane Doe'), 'activity exports must redact repeated employee names');
+assert.equal((redactedActivities.match(/Verint-Import-01/g) || []).length, 2, 'the same employee must keep one placeholder across date sections');
+const parsedRedactedActivities = parseVerintSchedule(activitiesWithNames);
+assert.deepEqual(Array.from(parsedRedactedActivities.agents, a => a.name), ['Verint-Import-01', 'Verint-Import-02']);
+
+const anonymizeImportedScheduleState = get('anonymizeImportedScheduleState');
+const legacyNamedState = cloneDefault();
+legacyNamedState.agents = [{
+  id: 'V001',
+  name: 'Real Imported Name',
+  shiftStart: '09:00',
+  shiftEnd: '17:00',
+  workDays: [0]
+}, {
+  id: 'A01',
+  name: 'Scenario Hire',
+  shiftStart: '09:00',
+  shiftEnd: '17:00',
+  workDays: [0],
+  source: 'manual'
+}];
+legacyNamedState.importedSchedule = {
+  grid: mkGrid('work'),
+  agentCount: 1,
+  agentIds: ['V001'],
+  filename: 'Jane Doe schedule.csv',
+  rawText: startEndWithNames
+};
+const anonymizedLegacyState = anonymizeImportedScheduleState(legacyNamedState);
+assert.equal(anonymizedLegacyState.agents[0].name, 'Verint-Import-01', 'older saved imports must be anonymized on load');
+assert.equal(anonymizedLegacyState.agents[1].name, 'Scenario Hire', 'scenario-added names must be preserved');
+assert.ok(!anonymizedLegacyState.importedSchedule.rawText.includes('Jane'), 'older retained raw imports must be scrubbed on load');
+assert.equal(anonymizedLegacyState.importedSchedule.filename, 'Verint schedule import', 'potentially identifying filenames must not be retained');
+
 // Scenario-added staff must be layered onto an imported Verint grid and their ramp
 // productivity must flow through as fractional effective capacity.
 const importedPlusHire = cloneDefault();
