@@ -258,6 +258,38 @@ const eaLo = erlangA(9.49, 30, 300, 90, 20, 900);
 const eaHi = erlangA(9.50, 30, 300, 90, 20, 900);
 assert.ok(eaHi.sl >= eaLo.sl, 'Erlang A must improve monotonically with staffing');
 assert.ok(eaHi.sl - eaLo.sl < 0.005, 'Erlang A must not jump at half-agent boundaries');
+const eaAnswered = erlangA(10, 40, 300, 1200, 30, 900);
+assert.ok(Math.abs(eaAnswered.asa - 336.069246) < 0.01, 'Erlang A ASA must measure wait among answered contacts');
+assert.ok(Math.abs(eaAnswered.avgWaitOffered - 303.585996) < 0.01, 'offered-contact queue time must remain available separately');
+
+// An overloaded interval cannot be discarded or reset at the next quarter hour. This
+// pattern previously reported about 2m09s because the 90-call spike was excluded; carrying
+// its backlog through the quieter intervals produces the roughly 20-minute operational wait.
+const computeSLA = get('computeSLA');
+const computeDailyMetrics = get('computeDailyMetrics');
+const queueConfig = cloneDefault().config;
+queueConfig.deskStart = '07:00';
+queueConfig.deskEnd = '09:15';
+queueConfig.dayHours = { 1: 'closed', 2: 'closed', 3: 'closed', 4: 'closed', 5: 'closed', 6: 'closed' };
+queueConfig.model = 'C';
+queueConfig.ahtSec = 300;
+queueConfig.downtimePct = 0;
+const queueVolume = Array.from({ length: 7 }, () => new Array(96).fill(0));
+const queueAvailability = Array.from({ length: 7 }, () => new Array(96).fill(0));
+[90, 26, 26, 26, 26, 26, 26, 26, 26].forEach((calls, offset) => {
+  queueVolume[0][28 + offset] = calls;
+  queueAvailability[0][28 + offset] = 10;
+});
+const backlogSla = computeSLA(queueVolume, queueAvailability, queueConfig);
+const backlogDay = computeDailyMetrics(backlogSla, queueConfig)[0];
+assert.ok(backlogDay.asa > 1000 && backlogDay.asa < 1400, 'backlog carryover must forecast the reproduced scenario near 20 minutes');
+assert.equal(backlogDay.unstableIntervals, 1, 'the overloaded spike must remain visible as a diagnostic interval');
+assert.ok(backlogSla[0][29].backlogStart > 50, 'the next interval must inherit the spike queue');
+assert.ok(Number.isFinite(backlogSla[0][28].asa), 'a transient overload with active agents must have a finite virtual wait');
+const sustainedVolume = queueVolume.map(row => row.slice());
+for (let i = 28; i < 37; i++) sustainedVolume[0][i] = 90;
+const sustainedDay = computeDailyMetrics(computeSLA(sustainedVolume, queueAvailability, queueConfig), queueConfig)[0];
+assert.ok(Number.isFinite(sustainedDay.asa) && sustainedDay.asa > 1000, 'an all-overloaded day must never collapse to a zero ASA');
 
 const parseQueueAnalytics = get('parseQueueAnalytics');
 const queueCsv = [
@@ -274,6 +306,13 @@ const escapedQueue = parseQueueAnalytics([
 ].join('\n'));
 assert.equal(escapedQueue.queueName, 'Customer "Care", Tier 2', 'escaped CSV quotes must round-trip');
 assert.equal(escapedQueue.intervals[0].volAct, 7);
+const answeredWeightedQueue = parseQueueAnalytics([
+  'Queue Name,Date,Time,Volume (Absolute Act),Abandons (Absolute Act),Average Speed to Answer (Absolute Act)',
+  'Queue,01/07/2026,07:00 AM,100,90,600',
+  'Queue,01/07/2026,07:15 AM,100,0,60'
+].join('\n'));
+assert.ok(Math.abs(answeredWeightedQueue.dailyRollup[0].asaAct - 12000 / 110) < 1e-8, 'imported ASA must be weighted by answered rather than offered contacts');
+assert.equal(answeredWeightedQueue.dailyRollup[0].answeredAct, 110);
 
 const regenerateVolumeFromUI = get('regenerateVolumeFromUI');
 const volumeState = cloneDefault();

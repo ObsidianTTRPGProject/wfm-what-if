@@ -719,6 +719,26 @@ const LAST_SEEN_VERSION_KEY = 'wfm-last-seen-version';
 // `tag` is one of 'feat' (new feature), 'fix' (bug fix), 'change' (behaviour change),
 // 'ui' (visual/interaction tweak). Plain strings default to 'feat'.
 const CHANGELOG = [{
+  version: '0.42.0',
+  date: '2026-07-30',
+  title: 'Backlog-aware ASA forecasting',
+  changes: [{
+    tag: 'fix',
+    text: 'ASA now carries queued contacts from one 15-minute interval into the next. Overloaded peaks no longer reset on the quarter hour or disappear from daily, weekly, and Months Ahead averages.'
+  }, {
+    tag: 'fix',
+    text: 'Overloaded intervals with active agents now receive a finite transient wait forecast and remain visibly flagged. A fully overloaded day can no longer report zero ASA.'
+  }, {
+    tag: 'fix',
+    text: 'Erlang A and Queue Analytics now follow the operational ASA definition: total wait for answered contacts divided by answered contacts. Abandoners no longer dilute the average.'
+  }, {
+    tag: 'change',
+    text: 'SLA, ASA, and abandonment forecasts use a sequential 15-second fluid queue pass over each day while preserving stationary Erlang results whenever no backlog exists.'
+  }, {
+    tag: 'change',
+    text: 'Regression coverage reproduces the previously understated 2–3 minute forecast and verifies the corrected roughly 20-minute result, inherited backlog, sustained overload handling, Erlang A answered ASA, and imported ASA weighting.'
+  }]
+}, {
   version: '0.41.0',
   date: '2026-07-30',
   title: 'Months Ahead — 12-month workforce and service forecast',
@@ -3204,6 +3224,8 @@ function parseQueueAnalytics(text) {
         dow: iv.dow,
         volAct: 0,
         volFor: 0,
+        answeredAct: 0,
+        answeredFor: 0,
         abAct: 0,
         abFor: 0,
         slActWeighted: 0,
@@ -3230,6 +3252,8 @@ function parseQueueAnalytics(text) {
     const d = dailyMap[iv.date];
     if (iv.volAct !== null) d.volAct += iv.volAct;
     if (iv.volFor !== null) d.volFor += iv.volFor;
+    if (iv.volAct !== null) d.answeredAct += Math.max(0, iv.volAct - (iv.abAct !== null ? iv.abAct : 0));
+    if (iv.volFor !== null) d.answeredFor += Math.max(0, iv.volFor - (iv.abFor !== null ? iv.abFor : 0));
     if (iv.abAct !== null) d.abAct += iv.abAct;
     if (iv.abFor !== null) d.abFor += iv.abFor;
     if (iv.slAct !== null && iv.volAct && iv.volAct > 0) {
@@ -3245,12 +3269,14 @@ function parseQueueAnalytics(text) {
       d.slReqCalls += iv.volFor;
     }
     if (iv.asaAct !== null && iv.volAct && iv.volAct > 0) {
-      d.asaActWeighted += iv.asaAct * iv.volAct;
-      d.asaActCalls += iv.volAct;
+      const answered = Math.max(0, iv.volAct - (iv.abAct !== null ? iv.abAct : 0));
+      d.asaActWeighted += iv.asaAct * answered;
+      d.asaActCalls += answered;
     }
     if (iv.asaFor !== null && iv.volFor && iv.volFor > 0) {
-      d.asaForWeighted += iv.asaFor * iv.volFor;
-      d.asaForCalls += iv.volFor;
+      const answered = Math.max(0, iv.volFor - (iv.abFor !== null ? iv.abFor : 0));
+      d.asaForWeighted += iv.asaFor * answered;
+      d.asaForCalls += answered;
     }
     if (iv.hcAct !== null) {
       d.hcActSum += iv.hcAct;
@@ -3275,6 +3301,8 @@ function parseQueueAnalytics(text) {
     dow: d.dow,
     volAct: d.volAct,
     volFor: d.volFor,
+    answeredAct: d.answeredAct,
+    answeredFor: d.answeredFor,
     abAct: d.abAct,
     abFor: d.abFor,
     slAct: d.slActCalls > 0 ? d.slActWeighted / d.slActCalls : null,
@@ -3322,12 +3350,12 @@ function parseQueueAnalytics(text) {
       slReqC += d.volFor;
     }
     if (d.asaAct !== null) {
-      asaActW += d.asaAct * d.volAct;
-      asaActC += d.volAct;
+      asaActW += d.asaAct * d.answeredAct;
+      asaActC += d.answeredAct;
     }
     if (d.asaFor !== null) {
-      asaForW += d.asaFor * d.volFor;
-      asaForC += d.volFor;
+      asaForW += d.asaFor * d.answeredFor;
+      asaForC += d.answeredFor;
     }
   }
   const weekly = {
@@ -5412,10 +5440,12 @@ function erlangA(agents, callsPerInterval, ahtSec, patienceSec, slTargetSec, int
     return {
       sl: 1,
       asa: 0,
+      avgWaitOffered: 0,
       occ: 0,
       pw: 0,
       pAbandon: 0,
       abandoned: 0,
+      answeredCalls: 0,
       traffic: 0,
       unstable: false
     };
@@ -5432,7 +5462,9 @@ function erlangA(agents, callsPerInterval, ahtSec, patienceSec, slTargetSec, int
     const r = serviceLevel(agents, callsPerInterval, ahtSec, slTargetSec, intervalSec);
     return Object.assign({}, r, {
       pAbandon: 0,
-      abandoned: 0
+      abandoned: 0,
+      answeredCalls: callsPerInterval,
+      avgWaitOffered: r.asa
     });
   }
   // Shrinkage can produce fractional effective staffing. Erlang A is defined for integer
@@ -5445,10 +5477,13 @@ function erlangA(agents, callsPerInterval, ahtSec, patienceSec, slTargetSec, int
     const hi = erlangA(nHi, callsPerInterval, ahtSec, patienceSec, slTargetSec, intervalSec);
     const f = agents - nLo;
     const out = {};
-    for (const key of ['sl', 'asa', 'occ', 'pw', 'pAbandon', 'abandoned', 'traffic']) {
+    for (const key of ['sl', 'occ', 'pw', 'pAbandon', 'abandoned', 'answeredCalls', 'traffic', 'avgWaitOffered']) {
       out[key] = lo[key] + f * (hi[key] - lo[key]);
     }
-    out.unstable = out.traffic >= agents;
+    const answeredWait = (isFinite(lo.asa) ? lo.asa * lo.answeredCalls : 0) * (1 - f) + (isFinite(hi.asa) ? hi.asa * hi.answeredCalls : 0) * f;
+    out.asa = out.answeredCalls > 0 ? answeredWait / out.answeredCalls : Infinity;
+    out.overloaded = out.traffic >= agents;
+    out.unstable = !isFinite(out.asa);
     return out;
   }
   const lambda = callsPerInterval / intervalSec;
@@ -5458,11 +5493,13 @@ function erlangA(agents, callsPerInterval, ahtSec, patienceSec, slTargetSec, int
   if (agents <= 0) {
     return {
       sl: 0,
-      asa: patienceSec,
+      asa: Infinity,
+      avgWaitOffered: patienceSec,
       occ: 1,
       pw: 1,
       pAbandon: 1,
       abandoned: callsPerInterval,
+      answeredCalls: 0,
       traffic,
       unstable: true
     };
@@ -5495,8 +5532,33 @@ function erlangA(agents, callsPerInterval, ahtSec, patienceSec, slTargetSec, int
   for (let k = N + 1; k <= lastK; k++) eQ += (k - N) * pi[k];
   const pAbandon = Math.min(1, theta * eQ / lambda);
   const abandoned = pAbandon * callsPerInterval;
+  const answeredCalls = Math.max(0, callsPerInterval - abandoned);
   const occ = lambda * (1 - pAbandon) / (N * mu);
-  const asa = eQ / lambda;
+  const avgWaitOffered = eQ / lambda;
+
+  // ASA is an answered-contact metric: total wait for answered contacts divided by
+  // answered contacts. eQ/lambda is the average queue time across every offered contact,
+  // including abandoners, so using it as ASA materially understates long waits when callers
+  // leave the queue. PASTA lets an arrival see state n with probability pi[n]. For an arrival
+  // with r positions in front of service, the probability it survives to service is
+  // N*mu/(N*mu+r*theta), and its conditional answered wait is the sum of the r competing
+  // event stages.
+  let pAnswered = 0;
+  let answeredWait = 0;
+  const serviceCapacity = N * mu;
+  for (let n = 0; n <= lastK; n++) {
+    if (n < N) {
+      pAnswered += pi[n];
+      continue;
+    }
+    const r = n - N + 1;
+    const pServe = serviceCapacity / (serviceCapacity + r * theta);
+    let conditionalWait = 0;
+    for (let j = 1; j <= r; j++) conditionalWait += 1 / (serviceCapacity + j * theta);
+    pAnswered += pi[n] * pServe;
+    answeredWait += pi[n] * pServe * conditionalWait;
+  }
+  const asa = pAnswered > 0 ? answeredWait / pAnswered : Infinity;
 
   // SL: P(no wait) + P(wait) * P(answered) * P(within target)
   const eW_given_wait = pw > 0 ? eQ / (lambda * pw) : 0;
@@ -5511,12 +5573,15 @@ function erlangA(agents, callsPerInterval, ahtSec, patienceSec, slTargetSec, int
   return {
     sl: Math.max(0, Math.min(1, sl)),
     asa,
+    avgWaitOffered,
     occ: Math.max(0, Math.min(1, occ)),
     pw: Math.max(0, Math.min(1, pw)),
     pAbandon: Math.max(0, Math.min(1, pAbandon)),
     abandoned,
+    answeredCalls,
     traffic,
-    unstable: traffic >= agents
+    overloaded: traffic >= agents,
+    unstable: !isFinite(asa)
   };
 }
 
@@ -5549,6 +5614,110 @@ function computeInterval(agents, callsPerInterval, config) {
     };
   }
   return Object.assign({}, r, aOverlay);
+}
+
+// Move a fluid queue forward while arrivals, service completions, and (for Erlang A)
+// abandonment occur together. Queue depth is measured in contacts waiting, not contacts
+// currently in service.
+function advanceFluidQueue(queue, arrivalRate, serviceRate, abandonRate, seconds) {
+  const q = Math.max(0, queue || 0);
+  const net = arrivalRate - serviceRate;
+  if (!(abandonRate > 0)) return Math.max(0, q + net * seconds);
+  if (q <= 0 && net <= 0) return 0;
+  const equilibrium = net / abandonRate;
+  return Math.max(0, equilibrium + (q - equilibrium) * Math.exp(-abandonRate * seconds));
+}
+
+function queueAnswerProbability(queueAhead, serviceRate, patienceSec) {
+  if (!(serviceRate > 0)) return 0;
+  if (!(patienceSec > 0) || !isFinite(patienceSec)) return 1;
+  const positions = Math.max(1, queueAhead + 1);
+  return serviceRate / (serviceRate + positions / patienceSec);
+}
+
+function queueAnsweredWait(queueAhead, serviceRate, patienceSec) {
+  if (!(serviceRate > 0)) return Infinity;
+  const positions = Math.max(0, queueAhead + 1);
+  if (!(patienceSec > 0) || !isFinite(patienceSec)) return positions / serviceRate;
+  const theta = 1 / patienceSec;
+  const whole = Math.floor(positions);
+  const fraction = positions - whole;
+  let wait = 0;
+  for (let j = 1; j <= whole; j++) wait += 1 / (serviceRate + j * theta);
+  if (fraction > 0) wait += fraction / (serviceRate + (whole + 1) * theta);
+  return wait;
+}
+
+// Stationary Erlang calculations treat each 15-minute interval as an isolated system.
+// Real queues do not reset on the quarter hour: a spike at 09:00 can keep callers waiting
+// through several quieter intervals. This sequential pass retains the stationary result when
+// no queue exists, then uses 15-second fluid substeps to carry backlog and its wait forward.
+function applyQueueCarryoverToDay(row, config, startIdx, endIdx) {
+  const intervalSec = 900;
+  const substeps = 60;
+  const stepSec = intervalSec / substeps;
+  const isA = config.model === 'A';
+  const patience = config.patienceSec > 0 ? config.patienceSec : 0;
+  const abandonRate = isA && patience > 0 ? 1 / patience : 0;
+  let queue = 0;
+  for (let i = startIdx; i < endIdx; i++) {
+    const r = row[i];
+    if (!r) continue;
+    const calls = Math.max(0, r.calls || 0);
+    const arrivalRate = calls / intervalSec;
+    const serviceRate = r.effectiveAgents > 0 && config.ahtSec > 0 ? r.effectiveAgents / config.ahtSec : 0;
+    const backlogStart = queue;
+    let asaNumerator = 0;
+    let asaWeight = 0;
+    let slNumerator = 0;
+    let abandoned = 0;
+    for (let step = 0; step < substeps; step++) {
+      const stepCalls = calls / substeps;
+      const qMid = advanceFluidQueue(queue, arrivalRate, serviceRate, abandonRate, stepSec / 2);
+      let stepASA = r.asa;
+      let stepSL = r.sl;
+      let stepAbandon = r.pAbandon || 0;
+      if (qMid > 1e-9 || !isFinite(stepASA)) {
+        const queueASA = queueAnsweredWait(qMid, serviceRate, isA ? patience : 0);
+        stepASA = isFinite(r.asa) ? Math.max(r.asa, queueASA) : queueASA;
+        if (isA) {
+          const pAnswer = queueAnswerProbability(qMid, serviceRate, patience);
+          stepAbandon = Math.max(stepAbandon, 1 - pAnswer);
+          const queueSL = isFinite(queueASA) && queueASA > 0 ? pAnswer * (1 - Math.exp(-config.slTargetSec / queueASA)) : 0;
+          stepSL = Math.min(stepSL, queueSL);
+        } else {
+          const queueSL = isFinite(queueASA) && queueASA > 0 ? 1 - Math.exp(-config.slTargetSec / queueASA) : 0;
+          stepSL = Math.min(stepSL, queueSL);
+          if (patience > 0) stepAbandon = Math.max(stepAbandon, 1 - queueAnswerProbability(qMid, serviceRate, patience));
+        }
+      }
+      const answeredWeight = isA ? stepCalls * Math.max(0, 1 - stepAbandon) : stepCalls;
+      if (isFinite(stepASA) && answeredWeight > 0) {
+        asaNumerator += stepASA * answeredWeight;
+        asaWeight += answeredWeight;
+      }
+      slNumerator += stepSL * stepCalls;
+      abandoned += stepAbandon * stepCalls;
+      queue = advanceFluidQueue(queue, arrivalRate, serviceRate, abandonRate, stepSec);
+    }
+    if (calls > 0 && !(serviceRate > 0) && patience > 0) abandoned = calls;
+    const overloaded = calls > 0 && r.traffic >= r.effectiveAgents;
+    const transientASA = asaWeight > 0 ? asaNumerator / asaWeight : calls > 0 ? Infinity : 0;
+    row[i] = Object.assign({}, r, {
+      sl: calls > 0 ? slNumerator / calls : r.sl,
+      asa: transientASA,
+      asaWeight,
+      pAbandon: calls > 0 ? Math.max(0, Math.min(1, abandoned / calls)) : 0,
+      abandoned,
+      answeredCalls: Math.max(0, calls - abandoned),
+      stationaryAsa: r.asa,
+      backlogStart,
+      backlogEnd: queue,
+      overloaded,
+      unstable: calls > 0 && !isFinite(transientASA)
+    });
+  }
+  return row;
 }
 function requiredAgents(callsPerInterval, config, intervalSec) {
   intervalSec = intervalSec || 900;
@@ -5764,7 +5933,7 @@ function averageCohortProductivity(cohortMonth, forecastMonth, startMonth, train
 function summariseForecastSLA(sla, config) {
   let calls = 0,
     weightedSL = 0,
-    stableCalls = 0,
+    answeredCalls = 0,
     weightedASA = 0,
     abandoned = 0,
     unstableIntervals = 0;
@@ -5776,18 +5945,18 @@ function summariseForecastSLA(sla, config) {
       calls += r.calls;
       weightedSL += r.sl * r.calls;
       abandoned += r.abandoned || 0;
-      if (r.unstable) {
-        unstableIntervals++;
-      } else if (isFinite(r.asa)) {
-        stableCalls += r.calls;
-        weightedASA += r.asa * r.calls;
+      if (r.overloaded || r.unstable) unstableIntervals++;
+      const asaWeight = r.asaWeight !== undefined ? r.asaWeight : config.model === 'A' ? Math.max(0, r.calls - (r.abandoned || 0)) : r.calls;
+      if (isFinite(r.asa) && asaWeight > 0) {
+        answeredCalls += asaWeight;
+        weightedASA += r.asa * asaWeight;
       }
     }
   }
   return {
     calls,
     sl: calls > 0 ? weightedSL / calls : 1,
-    asa: stableCalls > 0 ? weightedASA / stableCalls : unstableIntervals > 0 ? Infinity : 0,
+    asa: answeredCalls > 0 ? weightedASA / answeredCalls : calls > 0 ? Infinity : 0,
     abandoned,
     abandonPct: calls > 0 ? abandoned / calls : 0,
     unstableIntervals
@@ -8920,7 +9089,11 @@ function computeSLA(volume, availability, config) {
         required: req
       }));
     }
-    out.push(row);
+    if (isDayClosed(config, d)) {
+      out.push(row);
+    } else {
+      out.push(applyQueueCarryoverToDay(row, config, getDayStartIdx(config, d), getDayEndIdx(config, d)));
+    }
   }
   return out;
 }
@@ -8938,7 +9111,7 @@ function computeDailyMetrics(sla, config) {
       wOcc = 0,
       wPw = 0,
       abandoned = 0;
-    let stableCalls = 0,
+    let answeredCalls = 0,
       wASA = 0;
     let unstableIntervals = 0,
       unstableCalls = 0;
@@ -8953,18 +9126,19 @@ function computeDailyMetrics(sla, config) {
         wPw += r.pw * r.calls;
         abandoned += r.abandoned || 0;
         openIntervals++;
-        // ASA: only average across stable intervals so the daily mean stays meaningful even
-        // when one peak slice is overloaded.
-        if (r.unstable) {
+        if (r.overloaded || r.unstable) {
           unstableIntervals++;
           unstableCalls += r.calls;
-        } else if (isFinite(r.asa)) {
-          stableCalls += r.calls;
-          wASA += r.asa * r.calls;
         }
-        // Breach is per the active target metric. Unstable intervals always count as breaches.
+        // ASA is defined across answered contacts. Erlang C has no primary abandonment,
+        // while Erlang A weights by the contacts predicted to reach an agent.
+        const asaWeight = r.asaWeight !== undefined ? r.asaWeight : config.model === 'A' ? Math.max(0, r.calls - (r.abandoned || 0)) : r.calls;
+        if (isFinite(r.asa) && asaWeight > 0) {
+          answeredCalls += asaWeight;
+          wASA += r.asa * asaWeight;
+        }
         if (metric === 'asa') {
-          if (r.unstable || isFinite(r.asa) && r.asa > asaTarget) breach++;
+          if (!isFinite(r.asa) || r.asa > asaTarget) breach++;
         } else {
           if (r.sl < config.slTargetPct) breach++;
         }
@@ -8974,7 +9148,7 @@ function computeDailyMetrics(sla, config) {
       day: d,
       totalCalls,
       sl: totalCalls > 0 ? wSL / totalCalls : 0,
-      asa: stableCalls > 0 ? wASA / stableCalls : 0,
+      asa: answeredCalls > 0 ? wASA / answeredCalls : totalCalls > 0 ? Infinity : 0,
       occ: totalCalls > 0 ? wOcc / totalCalls : 0,
       pw: totalCalls > 0 ? wPw / totalCalls : 0,
       abandoned,
@@ -19437,12 +19611,14 @@ function ASAChart({
   for (const r of slice) {
     if (r.calls > 0) {
       dCalls += r.calls;
-      if (r.unstable) dUnstable++;else if (isFinite(r.asa)) {
-        dStableCalls += r.calls;
-        dWASA += r.asa * r.calls;
+      if (r.overloaded || r.unstable) dUnstable++;
+      if (isFinite(r.asa)) {
+        const asaWeight = r.asaWeight !== undefined ? r.asaWeight : state.config.model === 'A' ? Math.max(0, r.calls - (r.abandoned || 0)) : r.calls;
+        dStableCalls += asaWeight;
+        dWASA += r.asa * asaWeight;
         asaPairs.push({
           asa: r.asa,
-          calls: r.calls
+          calls: asaWeight
         });
       }
     }
@@ -19602,7 +19778,8 @@ function ASAChart({
         title: idxToTime(startIdx + i) + ' · no calls'
       }));
     }
-    const isUnstable = r.unstable;
+    const isUnstable = !isFinite(r.asa);
+    const isOverloaded = r.overloaded || r.unstable;
     const asaVal = isUnstable ? displayCap * 1.5 : r.asa;
     const overflow = asaVal > displayCap;
     const h = Math.min(100, asaVal / displayCap * 100);
@@ -19611,8 +19788,8 @@ function ASAChart({
     // bars reads as data, not a fire alarm. The reference lines below still
     // use alert tokens because they need to pop against the bars.
     let color = 'var(--chart-good)';
-    if (isUnstable || asaVal > asaTarget * 2) color = 'var(--chart-bad)';else if (asaVal > asaTarget) color = 'var(--chart-warn)';
-    const title = idxToTime(startIdx + i) + ' · ' + r.calls + ' calls · ' + r.agents + ' agents · occ ' + Math.round(r.occ * 100) + '%' + (isUnstable ? ' · UNSTABLE (traffic ≥ agents)' : ' · ASA ' + formatSeconds(r.asa));
+    if (isOverloaded || asaVal > asaTarget * 2) color = 'var(--chart-bad)';else if (asaVal > asaTarget) color = 'var(--chart-warn)';
+    const title = idxToTime(startIdx + i) + ' · ' + r.calls + ' calls · ' + r.agents + ' agents · occ ' + Math.round(r.occ * 100) + '%' + (isOverloaded ? ' · OVERLOADED' : '') + (isUnstable ? ' · ASA unavailable' : ' · ASA ' + formatSeconds(r.asa)) + (r.backlogStart > 0 ? ' · queue in ' + r.backlogStart.toFixed(1) : '');
     return /*#__PURE__*/React.createElement("div", {
       key: i,
       style: {
@@ -19680,7 +19857,7 @@ function ASAChart({
       color: 'var(--ink-dim)',
       lineHeight: 1.6
     }
-  }, /*#__PURE__*/React.createElement("strong", null, "How to read:"), " each bar is one 15-minute interval's expected ASA. Green = under target, amber = up to 2× target, red = above 2× target or unstable. Bars topped with ", /*#__PURE__*/React.createElement("strong", null, "↑"), " overflow the display scale; bars topped with ", /*#__PURE__*/React.createElement("strong", null, "∞"), " are unstable (traffic ≥ agents, Erlang C predicts unbounded wait). The mean line shows where the day average sits — when a few unstable or near-saturation bars are red, the mean is being pulled up by them while most calls (concentrated in green bars) wait far less."))));
+  }, /*#__PURE__*/React.createElement("strong", null, "How to read:"), " each bar is one 15-minute interval's expected ASA after carrying queued contacts forward. Green = under target, amber = up to 2× target, red = above 2× target or overloaded. Bars topped with ", /*#__PURE__*/React.createElement("strong", null, "↑"), " overflow the display scale; ", /*#__PURE__*/React.createElement("strong", null, "∞"), " means ASA is unavailable because no contacts can reach an agent. The mean is answered-contact weighted and includes finite waits from overloaded intervals."))));
 }
 
 // FTE Coverage Heatmap — day × interval grid showing scheduled minus required agents per cell.
@@ -20128,7 +20305,7 @@ function SLAHeatmap({
           label
         };
       },
-      legendLines: [isAsa ? 'Cell value = ASA in seconds · ∞ = unstable interval (offered ≥ effective agents)' : 'Cell value = SL % answered within target · — = unstable interval']
+      legendLines: [isAsa ? 'Cell value = backlog-aware ASA in seconds · ∞ = no answer capacity' : 'Cell value = SL % answered within target · — = unavailable interval']
     });
   };
   const exportCSV = () => {
@@ -20451,9 +20628,9 @@ function ForecastDiagnostic({
   let totalCalls = 0,
     weightedSL = 0,
     weightedTraffic = 0;
-  // ASA averaged ONLY across stable intervals (traffic < agents). Unstable intervals have
-  // undefined-in-the-limit ASA; including them with any kind of cap creates a misleading
-  // weekly mean that no real-world report would match.
+  // ASA is answered-contact weighted and includes finite waits from overloaded intervals.
+  // The sequential engine carries their backlog into later intervals rather than treating
+  // every quarter hour as an isolated stationary queue.
   let stableCalls = 0,
     weightedASA = 0;
   let totalUnstable = 0,
@@ -20482,17 +20659,19 @@ function ForecastDiagnostic({
       weightedTraffic += (r.traffic || 0) * r.calls;
       totalAgentSec += (r.agents || 0) * 900;
       totalTrafficSec += (r.traffic || 0) * 900;
-      if (r.unstable) {
+      if (r.overloaded || r.unstable) {
         totalUnstable++;
         unstableCalls += r.calls;
-      } else if (isFinite(r.asa)) {
-        stableCalls += r.calls;
-        weightedASA += r.asa * r.calls;
+      }
+      const asaWeight = r.asaWeight !== undefined ? r.asaWeight : config.model === 'A' ? Math.max(0, r.calls - (r.abandoned || 0)) : r.calls;
+      if (isFinite(r.asa) && asaWeight > 0) {
+        stableCalls += asaWeight;
+        weightedASA += r.asa * asaWeight;
         // Stressed-but-stable: agents exist but barely cover traffic
         if (r.occ >= 0.90) {
           nearSatIntervals++;
-          nearSatCalls += r.calls;
-          nearSatASA += r.asa * r.calls;
+          nearSatCalls += asaWeight;
+          nearSatASA += r.asa * asaWeight;
         }
       }
       if ((r.traffic || 0) > trafficMaxPeak) {
@@ -20501,9 +20680,7 @@ function ForecastDiagnostic({
       }
     }
   }
-  // Stable-only mean. If everything is unstable (which shouldn't happen with reasonable staffing)
-  // this falls back to 0; the diagnostic boxes below explain why.
-  const avgASA = stableCalls > 0 ? weightedASA / stableCalls : 0;
+  const avgASA = stableCalls > 0 ? weightedASA / stableCalls : totalCalls > 0 ? Infinity : 0;
   const avgSL = totalCalls > 0 ? weightedSL / totalCalls : 0;
   const avgTraffic = totalCalls > 0 ? weightedTraffic / totalCalls : 0;
   // Coverage ratio = available agent-seconds / required agent-seconds. > 1 = some slack; < 1 = under-capacity.
@@ -20526,8 +20703,8 @@ function ForecastDiagnostic({
   if (unstablePct > 0.05) {
     diagnoses.push({
       severity: unstablePct > 0.2 ? 'high' : 'mid',
-      title: unstableCalls.toLocaleString() + ' calls fall in unstable intervals (' + (unstableCallsPct * 100).toFixed(0) + '% of total)',
-      detail: 'In ' + totalUnstable + ' interval' + (totalUnstable === 1 ? '' : 's') + ' (' + (unstablePct * 100).toFixed(0) + '% of open intervals), traffic equals or exceeds scheduled agents. Erlang C returns infinite ASA for these so they\'re excluded from the average — but they\'re your real bottleneck.'
+      title: unstableCalls.toLocaleString() + ' calls fall in overloaded intervals (' + (unstableCallsPct * 100).toFixed(0) + '% of total)',
+      detail: 'In ' + totalUnstable + ' interval' + (totalUnstable === 1 ? '' : 's') + ' (' + (unstablePct * 100).toFixed(0) + '% of open intervals), traffic equals or exceeds effective agents. Their queued contacts now carry forward and their finite waits are included in forecast ASA.'
     });
   }
   // The most common "weird-looking numbers" scenario: SL looks fine but mean ASA is high.
@@ -20593,7 +20770,7 @@ function ForecastDiagnostic({
     }
   }, stableCalls > 0 ? formatSeconds(avgASA) : '—'), /*#__PURE__*/React.createElement("div", {
     className: "kpi-s"
-  }, totalUnstable > 0 ? 'excl. ' + totalUnstable + ' overloaded interval' + (totalUnstable === 1 ? '' : 's') : 'call-weighted across all open intervals')), /*#__PURE__*/React.createElement("div", {
+  }, totalUnstable > 0 ? 'incl. ' + totalUnstable + ' overloaded interval' + (totalUnstable === 1 ? '' : 's') + ' with queue carryover' : 'answered-contact weighted across all open intervals')), /*#__PURE__*/React.createElement("div", {
     className: "kpi"
   }, /*#__PURE__*/React.createElement("div", {
     className: "kpi-l"
@@ -20610,7 +20787,7 @@ function ForecastDiagnostic({
     className: "kpi"
   }, /*#__PURE__*/React.createElement("div", {
     className: "kpi-l"
-  }, "Unstable Intervals"), /*#__PURE__*/React.createElement("div", {
+  }, "Overloaded Intervals"), /*#__PURE__*/React.createElement("div", {
     className: "kpi-v",
     style: {
       color: totalUnstable > 0 ? 'var(--bad)' : 'var(--ink-dim)'
@@ -20728,7 +20905,7 @@ function ForecastDiagnostic({
       color: 'var(--ink-dim)',
       lineHeight: 1.6
     }
-  }, /*#__PURE__*/React.createElement("strong", null, "How to read this:"), " Coverage < 100% means you've scheduled fewer agent-hours than the raw workload requires — the queue cannot drain and Erlang predicts very long waits. \"Unstable intervals\" are slices where traffic ≥ scheduled agents in that 15-minute window; Erlang C reports infinite ASA there. The forecast averages across all intervals, so even a handful of unstable peak intervals can dominate the weekly number."))));
+  }, /*#__PURE__*/React.createElement("strong", null, "How to read this:"), " Coverage < 100% means you've scheduled fewer agent-hours than the raw workload requires, so the queue grows. \"Overloaded intervals\" are slices where traffic ≥ effective agents. The forecast carries that backlog into following intervals and calculates ASA across answered contacts, matching how ACD reports define the metric."))));
 }
 function AbandonmentPanel({
   state,
@@ -23295,13 +23472,11 @@ function ShrinkagePanel({
     return plannedDays > 0 || uMode !== 'off' ? 1 : 0; // sentinel: nonzero = active
   })();
 
-  // Weekly SL/ASA — exclude unstable intervals from ASA average because they would
-  // otherwise contribute "infinite" wait and swamp the weighted mean. SL is still
-  // computed across all intervals (unstable intervals correctly contribute SL=0).
+  // Weekly SL/ASA includes finite backlog-aware waits from overloaded intervals.
   const weeklyMetrics = slaArr => {
     let totalCalls = 0,
       wSL = 0;
-    let stableCalls = 0,
+    let answeredCalls = 0,
       wASA = 0;
     for (let d = 0; d < 7; d++) {
       if (isDayClosed(state.config, d)) continue;
@@ -23312,16 +23487,17 @@ function ShrinkagePanel({
         if (r && r.calls > 0) {
           totalCalls += r.calls;
           wSL += r.sl * r.calls;
-          if (isFinite(r.asa) && !r.unstable) {
-            stableCalls += r.calls;
-            wASA += r.asa * r.calls;
+          const asaWeight = r.asaWeight !== undefined ? r.asaWeight : state.config.model === 'A' ? Math.max(0, r.calls - (r.abandoned || 0)) : r.calls;
+          if (isFinite(r.asa) && asaWeight > 0) {
+            answeredCalls += asaWeight;
+            wASA += r.asa * asaWeight;
           }
         }
       }
     }
     return {
       sl: totalCalls > 0 ? wSL / totalCalls : 0,
-      asa: stableCalls > 0 ? wASA / stableCalls : 0,
+      asa: answeredCalls > 0 ? wASA / answeredCalls : totalCalls > 0 ? Infinity : 0,
       totalCalls
     };
   };
@@ -23870,8 +24046,8 @@ function SummaryStrip({
   let totalAbandoned = 0;
   let breachIntervals = 0,
     totalIntervals = 0;
-  // ASA needs separate accounting: only stable intervals (traffic < agents) contribute.
-  // We also collect (calls, asa) pairs for percentile computation, since Erlang C's per-interval
+  // ASA needs separate answered-contact weighting from SLA's offered-contact weighting.
+  // We also collect (answered contacts, ASA) pairs for percentile computation, since per-interval
   // ASA is heavy-tailed when intervals run near saturation — a handful of "stressed-but-stable"
   // intervals can balloon the mean even when most calls have tiny waits. The median is much
   // closer to what real-world ACDs report as ASA.
@@ -23893,21 +24069,23 @@ function SummaryStrip({
         weightedPw += r.pw * r.calls;
         totalAbandoned += r.abandoned || 0;
         totalIntervals++;
-        if (r.unstable) {
+        if (r.overloaded || r.unstable) {
           unstableIntervals++;
           unstableCalls += r.calls;
-        } else if (isFinite(r.asa)) {
-          stableCalls += r.calls;
-          weightedASA += r.asa * r.calls;
+        }
+        const asaWeight = r.asaWeight !== undefined ? r.asaWeight : state.config.model === 'A' ? Math.max(0, r.calls - (r.abandoned || 0)) : r.calls;
+        if (isFinite(r.asa) && asaWeight > 0) {
+          stableCalls += asaWeight;
+          weightedASA += r.asa * asaWeight;
           stableASAList.push({
             asa: r.asa,
-            calls: r.calls
+            calls: asaWeight
           });
         }
         // Breach detection uses the active target metric. Unstable intervals count as breaches.
         const metric = state.config.targetMetric || 'sl';
         if (metric === 'asa') {
-          if (r.unstable || isFinite(r.asa) && r.asa > (state.config.asaTargetSec || 60)) breachIntervals++;
+          if (!isFinite(r.asa) || r.asa > (state.config.asaTargetSec || 60)) breachIntervals++;
         } else {
           if (r.sl < state.config.slTargetPct) breachIntervals++;
         }
@@ -23935,7 +24113,7 @@ function SummaryStrip({
   const medianASA = weightedQuantile(stableASAList, 0.5);
   const p90ASA = weightedQuantile(stableASAList, 0.90);
   const avgSL = totalCalls > 0 ? weightedSL / totalCalls : 0;
-  // Mean ASA is the headline — matches how ACDs report ASA (total wait / total calls).
+  // Mean ASA is the headline — matches how ACDs report ASA (answered wait / answered contacts).
   // It will be higher than median when a small fraction of intervals run near saturation.
   const meanASA = stableCalls > 0 ? weightedASA / stableCalls : 0;
   const avgOcc = totalCalls > 0 ? weightedOcc / totalCalls : 0;
@@ -23955,7 +24133,7 @@ function SummaryStrip({
   const meanVsMedian = medianASA > 0 ? meanASA / Math.max(medianASA, 1) : meanASA > 30 ? 99 : 1;
   let asaSub;
   if (unstableIntervals > 0) {
-    asaSub = 'excl. ' + unstableIntervals + ' overloaded interval' + (unstableIntervals === 1 ? '' : 's') + ' (' + unstableCalls.toLocaleString() + ' calls) · median ' + formatSeconds(medianASA);
+    asaSub = 'incl. ' + unstableIntervals + ' overloaded interval' + (unstableIntervals === 1 ? '' : 's') + ' with queue carryover · median ' + formatSeconds(medianASA);
   } else if (meanVsMedian > 5 && meanASA > 30) {
     asaSub = 'mean · median is ' + formatSeconds(medianASA) + ' — peak intervals skew the mean up';
   } else {
@@ -26182,12 +26360,12 @@ function ReviewPanel({
         slReqC += d.volFor;
       }
       if (d.asaAct !== null) {
-        asaActW += d.asaAct * d.volAct;
-        asaActC += d.volAct;
+        asaActW += d.asaAct * (d.answeredAct !== undefined ? d.answeredAct : d.volAct);
+        asaActC += d.answeredAct !== undefined ? d.answeredAct : d.volAct;
       }
       if (d.asaFor !== null) {
-        asaForW += d.asaFor * d.volFor;
-        asaForC += d.volFor;
+        asaForW += d.asaFor * (d.answeredFor !== undefined ? d.answeredFor : d.volFor);
+        asaForC += d.answeredFor !== undefined ? d.answeredFor : d.volFor;
       }
     }
     const weekly = {
