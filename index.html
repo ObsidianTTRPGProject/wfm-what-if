@@ -342,6 +342,74 @@
   }
   table.data td { padding: 6px 10px; border-bottom: 1px solid var(--line); }
   table.data tr:hover td { background: var(--panel-2); }
+  .months-ahead-table-wrap { overflow-x: auto; }
+  table.months-ahead { min-width: 1280px; }
+  table.months-ahead th { white-space: nowrap; vertical-align: bottom; }
+  table.months-ahead th .th-help {
+    display: block;
+    margin-top: 3px;
+    color: var(--ink-faint);
+    font-size: 8px;
+    letter-spacing: 0;
+    text-transform: none;
+    font-weight: 400;
+  }
+  table.months-ahead td { white-space: nowrap; }
+  table.months-ahead td.month-name {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--panel);
+    min-width: 112px;
+    font-weight: 600;
+  }
+  table.months-ahead tr:hover td.month-name { background: var(--panel-2); }
+  table.months-ahead input {
+    min-width: 0;
+    padding: 6px 7px;
+    font-size: 11px;
+  }
+  .months-ahead-intro {
+    display: grid;
+    grid-template-columns: minmax(260px, 1.25fr) minmax(240px, 1fr);
+    gap: 16px;
+    align-items: start;
+  }
+  .months-ahead-note {
+    padding: 12px 14px;
+    background: var(--panel-2);
+    border-left: 3px solid var(--accent);
+    color: var(--ink-dim);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1.65;
+  }
+  .months-ahead-trajectory {
+    display: grid;
+    grid-template-columns: repeat(12, minmax(76px, 1fr));
+    gap: 5px;
+    margin-top: 14px;
+    min-width: 980px;
+  }
+  .months-ahead-tile {
+    padding: 9px 7px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-top: 3px solid var(--line-2);
+    border-radius: 3px;
+    font-family: var(--mono);
+    text-align: center;
+  }
+  .months-ahead-tile.good { border-top-color: var(--good); }
+  .months-ahead-tile.warn { border-top-color: var(--warn); }
+  .months-ahead-tile.bad { border-top-color: var(--bad); }
+  .months-ahead-tile .month { color: var(--ink-faint); font-size: 9px; text-transform: uppercase; }
+  .months-ahead-tile .sl { margin-top: 5px; font-size: 16px; font-weight: 600; }
+  .months-ahead-tile .asa { margin-top: 3px; color: var(--ink-dim); font-size: 9px; }
+  @media (max-width: 800px) {
+    .months-ahead-intro { grid-template-columns: 1fr; }
+    .months-ahead-intro .grid-3 { grid-template-columns: 1fr; }
+  }
   .day-switcher { display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }
   .day-switcher button {
     background: var(--panel-2);
@@ -651,6 +719,23 @@ const LAST_SEEN_VERSION_KEY = 'wfm-last-seen-version';
 // `tag` is one of 'feat' (new feature), 'fix' (bug fix), 'change' (behaviour change),
 // 'ui' (visual/interaction tweak). Plain strings default to 'feat'.
 const CHANGELOG = [{
+  version: '0.41.0',
+  date: '2026-07-30',
+  title: 'Months Ahead — 12-month workforce and service forecast',
+  changes: [{
+    tag: 'feat',
+    text: 'New Months Ahead tab projects 12 calendar months from the live weekly scenario, carrying forward its roster shape, volume profile, AHT, service target, shrinkage, patience, and Erlang model.'
+  }, {
+    tag: 'feat',
+    text: 'Plan hires, training time, a linear 50% to 100% proficiency ramp, monthly attrition, and proficient manual joins or exits. Each month shows projected people and effective floor FTE.'
+  }, {
+    tag: 'feat',
+    text: 'Demand planning supports permanent signed weekly volume step-changes plus a separate month-only seasonality multiplier, so structural growth and seasonal peaks can be modelled independently.'
+  }, {
+    tag: 'feat',
+    text: 'Every forecast month includes call-weighted SLA, mean stable-interval ASA, overloaded-interval warnings, and Erlang A abandonment percentage and estimated calendar-month abandoned calls.'
+  }]
+}, {
   version: '0.40.2',
   date: '2026-07-28',
   title: 'Privacy-safe Verint schedule imports',
@@ -5456,7 +5541,7 @@ function computeInterval(agents, callsPerInterval, config) {
     abandoned: 0
   };
   const patience = config.patienceSec || 0;
-  if (patience > 0 && callsPerInterval > 0 && agents > 0) {
+  if (patience > 0 && callsPerInterval > 0) {
     const ea = erlangA(agents, callsPerInterval, config.ahtSec, patience, config.slTargetSec);
     aOverlay = {
       pAbandon: ea.pAbandon,
@@ -5548,6 +5633,256 @@ function makeDefaultAgents(count) {
       workDays: [0, 1, 2, 3, 4]
     };
   });
+}
+
+// =============================================================================
+// MONTHS AHEAD — 12-month workforce and demand projection
+// =============================================================================
+// The monthly model intentionally reuses the live week's interval shape and queueing
+// configuration. It does not invent a second WFM model: staffing changes scale the current
+// on-queue pattern and demand changes scale the current volume pattern, then computeSLA runs
+// the same Erlang C / Erlang A engine used everywhere else in the app.
+const MONTHS_AHEAD_COUNT = 12;
+function nextCalendarMonthIso(fromDate) {
+  const d = fromDate instanceof Date ? fromDate : new Date();
+  const next = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+  return next.getFullYear() + '-' + String(next.getMonth() + 1).padStart(2, '0');
+}
+function makeMonthsAheadRows() {
+  return Array.from({
+    length: MONTHS_AHEAD_COUNT
+  }, () => ({
+    hires: 0,
+    attrition: 0,
+    manualIn: 0,
+    manualOut: 0,
+    volumeDelta: 0,
+    seasonalityPct: 100
+  }));
+}
+function makeDefaultMonthsAhead() {
+  return {
+    startMonth: nextCalendarMonthIso(),
+    trainingWeeks: 4,
+    proficientWeeks: 8,
+    rows: makeMonthsAheadRows()
+  };
+}
+function normaliseMonthsAhead(value) {
+  const base = makeDefaultMonthsAhead();
+  const source = value || {};
+  const rows = makeMonthsAheadRows().map((row, i) => {
+    const incoming = source.rows && source.rows[i] || {};
+    return Object.assign({}, row, incoming, {
+      hires: Math.max(0, Math.round(+incoming.hires || 0)),
+      attrition: Math.max(0, Math.round(+incoming.attrition || 0)),
+      manualIn: Math.max(0, Math.round(+incoming.manualIn || 0)),
+      manualOut: Math.max(0, Math.round(+incoming.manualOut || 0)),
+      volumeDelta: isFinite(+incoming.volumeDelta) ? +incoming.volumeDelta : 0,
+      seasonalityPct: isFinite(+incoming.seasonalityPct) ? Math.max(0, +incoming.seasonalityPct) : 100
+    });
+  });
+  return {
+    startMonth: /^\d{4}-\d{2}$/.test(source.startMonth || '') ? source.startMonth : base.startMonth,
+    trainingWeeks: Math.max(0, +source.trainingWeeks || 0),
+    proficientWeeks: Math.max(0, +source.proficientWeeks || 0),
+    rows
+  };
+}
+function monthDateAt(startMonth, offset) {
+  const parts = String(startMonth || '').split('-').map(Number);
+  const year = parts[0] || new Date().getFullYear();
+  const month = (parts[1] || 1) - 1;
+  return new Date(year, month + offset, 1);
+}
+function monthIsoAt(startMonth, offset) {
+  const d = monthDateAt(startMonth, offset);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+}
+function daysInMonthIso(monthIso) {
+  const d = monthDateAt(monthIso, 0);
+  return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+}
+function weeklyOpenVolume(volume, config) {
+  let total = 0;
+  for (let d = 0; d < 7; d++) {
+    if (isDayClosed(config, d)) continue;
+    const start = getDayStartIdx(config, d);
+    const end = getDayEndIdx(config, d);
+    for (let i = start; i < end; i++) total += Math.max(0, +(volume[d] && volume[d][i]) || 0);
+  }
+  return total;
+}
+function scaleForecastVolume(volume, config, weeklyTarget) {
+  const target = Math.max(0, +weeklyTarget || 0);
+  const current = weeklyOpenVolume(volume, config);
+  if (target <= 0) return Array.from({
+    length: 7
+  }, () => new Array(INTERVALS_PER_DAY).fill(0));
+  if (current > 0) {
+    const factor = target / current;
+    return volume.map(row => row.map(v => Math.max(0, (+v || 0) * factor)));
+  }
+  // A zero-volume baseline has no shape to scale. Spread the requested volume evenly across
+  // the configured open intervals so a user can still introduce demand in a later month.
+  let openIntervals = 0;
+  for (let d = 0; d < 7; d++) {
+    if (!isDayClosed(config, d)) openIntervals += Math.max(0, getDayEndIdx(config, d) - getDayStartIdx(config, d));
+  }
+  const perInterval = openIntervals > 0 ? target / openIntervals : 0;
+  return Array.from({
+    length: 7
+  }, (_, d) => {
+    const row = new Array(INTERVALS_PER_DAY).fill(0);
+    if (isDayClosed(config, d)) return row;
+    for (let i = getDayStartIdx(config, d); i < getDayEndIdx(config, d); i++) row[i] = perInterval;
+    return row;
+  });
+}
+function averageCohortProductivity(cohortMonth, forecastMonth, startMonth, trainingWeeks, proficientWeeks) {
+  const cohortDate = monthDateAt(startMonth, cohortMonth);
+  const forecastDate = monthDateAt(startMonth, forecastMonth);
+  const days = daysInMonthIso(monthIsoAt(startMonth, forecastMonth));
+  // Use UTC calendar boundaries for elapsed days so daylight-saving transitions cannot
+  // introduce a one-hour ramp error in time zones that change offset during the horizon.
+  const elapsedBeforeMonth = (Date.UTC(forecastDate.getFullYear(), forecastDate.getMonth(), 1) - Date.UTC(cohortDate.getFullYear(), cohortDate.getMonth(), 1)) / 86400000;
+  let total = 0;
+  // Daily midpoint sampling gives calendar-month averages: a cohort finishing training
+  // halfway through a month contributes only for the part of that month it is on-floor.
+  for (let day = 0; day < days; day++) {
+    const ageWeeks = (elapsedBeforeMonth + day + 0.5) / 7;
+    if (ageWeeks < trainingWeeks) continue;
+    if (proficientWeeks <= 0) {
+      total += 1;
+      continue;
+    }
+    const rampProgress = Math.max(0, Math.min(1, (ageWeeks - trainingWeeks) / proficientWeeks));
+    total += 0.5 + 0.5 * rampProgress;
+  }
+  return days > 0 ? total / days : 0;
+}
+function summariseForecastSLA(sla, config) {
+  let calls = 0,
+    weightedSL = 0,
+    stableCalls = 0,
+    weightedASA = 0,
+    abandoned = 0,
+    unstableIntervals = 0;
+  for (let d = 0; d < 7; d++) {
+    if (isDayClosed(config, d)) continue;
+    for (let i = getDayStartIdx(config, d); i < getDayEndIdx(config, d); i++) {
+      const r = sla[d][i];
+      if (!r || r.calls <= 0) continue;
+      calls += r.calls;
+      weightedSL += r.sl * r.calls;
+      abandoned += r.abandoned || 0;
+      if (r.unstable) {
+        unstableIntervals++;
+      } else if (isFinite(r.asa)) {
+        stableCalls += r.calls;
+        weightedASA += r.asa * r.calls;
+      }
+    }
+  }
+  return {
+    calls,
+    sl: calls > 0 ? weightedSL / calls : 1,
+    asa: stableCalls > 0 ? weightedASA / stableCalls : unstableIntervals > 0 ? Infinity : 0,
+    abandoned,
+    abandonPct: calls > 0 ? abandoned / calls : 0,
+    unstableIntervals
+  };
+}
+function computeMonthsAheadForecast(state, grid, baselineAvailability) {
+  const plan = normaliseMonthsAhead(state.monthsAhead);
+  const baselineHeadcount = (state.agents || []).length;
+  const fullGrid = Array.from({
+    length: 7
+  }, (_, d) => {
+    const row = new Array(INTERVALS_PER_DAY).fill(0);
+    const dayGrid = grid[d] || [];
+    for (let a = 0; a < dayGrid.length; a++) {
+      for (let i = 0; i < INTERVALS_PER_DAY; i++) if (dayGrid[a][i] === 'work') row[i]++;
+    }
+    return row;
+  });
+  let perHeadAvailability = fullGrid.map(row => row.map(v => baselineHeadcount > 0 ? v / baselineHeadcount : 0));
+  let perHeadHours = perHeadAvailability.reduce((sum, row) => sum + row.reduce((s, v) => s + v, 0), 0);
+  let baselineHours = baselineAvailability.reduce((sum, row) => sum + row.reduce((s, v) => s + v, 0), 0);
+
+  // If the current scenario has no agents, create a reasonable one-person weekly shape from
+  // the configured desk hours. This keeps future hires useful instead of projecting zero
+  // capacity forever.
+  if (baselineHeadcount === 0 || perHeadHours <= 0) {
+    perHeadAvailability = Array.from({
+      length: 7
+    }, (_, d) => {
+      const row = new Array(INTERVALS_PER_DAY).fill(0);
+      if (isDayClosed(state.config, d)) return row;
+      const start = getDayStartIdx(state.config, d);
+      const end = Math.min(getDayEndIdx(state.config, d), start + 32);
+      for (let i = start; i < end; i++) row[i] = 1;
+      return row;
+    });
+    perHeadHours = perHeadAvailability.reduce((sum, row) => sum + row.reduce((s, v) => s + v, 0), 0);
+    baselineHours = 0;
+  }
+  const baselineEffectiveFTE = perHeadHours > 0 ? baselineHours / perHeadHours : baselineHeadcount;
+  const baselineWeeklyVolume = weeklyOpenVolume(state.volume, state.config);
+  let cumulativeHires = 0,
+    cumulativeAttrition = 0,
+    cumulativeManualIn = 0,
+    cumulativeManualOut = 0,
+    cumulativeVolumeDelta = 0;
+  const cohorts = [];
+  const out = [];
+  for (let monthIndex = 0; monthIndex < MONTHS_AHEAD_COUNT; monthIndex++) {
+    const row = plan.rows[monthIndex];
+    cumulativeHires += row.hires;
+    cumulativeAttrition += row.attrition;
+    cumulativeManualIn += row.manualIn;
+    cumulativeManualOut += row.manualOut;
+    cumulativeVolumeDelta += row.volumeDelta;
+    if (row.hires > 0) cohorts.push({
+      monthIndex,
+      count: row.hires
+    });
+    const staffHeadcount = Math.max(0, baselineHeadcount + cumulativeHires + cumulativeManualIn - cumulativeAttrition - cumulativeManualOut);
+    let hireFloorFTE = 0;
+    for (const cohort of cohorts) {
+      hireFloorFTE += cohort.count * averageCohortProductivity(cohort.monthIndex, monthIndex, plan.startMonth, plan.trainingWeeks, plan.proficientWeeks);
+    }
+    const projectedFloorFTE = Math.max(0, Math.min(staffHeadcount, baselineEffectiveFTE + cumulativeManualIn - cumulativeManualOut - cumulativeAttrition + hireFloorFTE));
+    const capacityDelta = projectedFloorFTE - baselineEffectiveFTE;
+    const monthAvailability = baselineAvailability.map((dayRow, d) => dayRow.map((value, i) => Math.max(0, value + perHeadAvailability[d][i] * capacityDelta)));
+    const seasonality = Math.max(0, row.seasonalityPct) / 100;
+    const preSeasonWeeklyVolume = Math.max(0, baselineWeeklyVolume + cumulativeVolumeDelta);
+    const weeklyVolume = preSeasonWeeklyVolume * seasonality;
+    const monthVolume = scaleForecastVolume(state.volume, state.config, weeklyVolume);
+    const sla = computeSLA(monthVolume, monthAvailability, state.config);
+    const metrics = summariseForecastSLA(sla, state.config);
+    const monthIso = monthIsoAt(plan.startMonth, monthIndex);
+    const calendarFactor = daysInMonthIso(monthIso) / 7;
+    out.push(Object.assign({}, metrics, {
+      monthIndex,
+      monthIso,
+      staffHeadcount,
+      floorFTE: projectedFloorFTE,
+      hireFloorFTE,
+      weeklyVolume,
+      monthlyCalls: metrics.calls * calendarFactor,
+      monthlyAbandoned: metrics.abandoned * calendarFactor,
+      seasonalityPct: row.seasonalityPct,
+      cumulativeVolumeDelta
+    }));
+  }
+  return {
+    plan,
+    baselineHeadcount,
+    baselineEffectiveFTE,
+    baselineWeeklyVolume,
+    months: out
+  };
 }
 
 // Return the row in importedSchedule.grid that belongs to an agent, or -1 when the
@@ -5655,6 +5990,9 @@ const DEFAULT_STATE = {
   name: 'Untitled Scenario',
   volume: makeDefaultVolume(),
   agents: makeDefaultAgents(15),
+  // Twelve-month projection settings. Monthly rows are positional from startMonth and
+  // contain workforce movements plus demand step-changes / seasonal multipliers.
+  monthsAhead: makeDefaultMonthsAhead(),
   trainingSessions: [],
   patterns: {},
   // Back-office admin workstreams. Each item: { id, name, dayH: [Mon..Sun], startWipH, enabled }
@@ -5751,6 +6089,10 @@ const DEFAULT_STATE = {
     bandStepMin: 30,
     // Hours that count as one FTE-week, for the required-vs-scheduled FTE callout.
     fteWeeklyHours: 40,
+    // Loaded-roster insight: count shifts whose scheduled finish falls inside this
+    // configurable window. The default represents 19:00 through midnight.
+    insightFinishStart: '19:00',
+    insightFinishEnd: '00:00',
     // Shift templates the rotation can use. `evening` tags templates that count toward
     // the evening-shift fairness rule. `start` is the EARLIEST start; `bandLatest` (if
     // later than start) makes it a start band — the engine chooses each person's start
@@ -7723,6 +8065,106 @@ function computePlannedAvailability(state, plan) {
 // The generator is greedy with fairness-counter ranking + seeded tie-breaks: at
 // service-desk scale that lands within a shift or two of optimal, and determinism
 // (same seed → same roster) matters more than squeezing the last swap.
+
+function finishFallsInWindow(endMin, startTime, endTime) {
+  const value = ((+endMin || 0) % 1440 + 1440) % 1440;
+  const start = timeToIdx(startTime || '19:00') * INTERVAL_MIN % 1440;
+  const end = timeToIdx(endTime || '00:00') * INTERVAL_MIN % 1440;
+  if (start === end) return value === start;
+  return start < end ? value >= start && value <= end : value >= start || value <= end;
+}
+
+// Summarise the roster evidence already loaded into the simulator. Imported multi-week
+// files are re-parsed one week at a time so counts reflect actual shift assignments rather
+// than the currently selected week or each agent's median shift. Results are normalised to
+// an average month (52 weeks / 12 months) and averaged across the sampled employee pool.
+function computeLoadedRosterInsights(state, finishStart, finishEnd) {
+  const records = [];
+  const people = new Set();
+  const imp = state && state.importedSchedule;
+  let sampleWeeks = 0;
+  let source = 'configured weekly roster';
+  if (imp && imp.rawText) {
+    const weekKeys = imp.weeks && imp.weeks.length ? imp.weeks.map(w => w.weekStartIso) : [imp.selectedWeekIso || null];
+    for (const weekStartIso of weekKeys) {
+      try {
+        const parsed = parseVerintSchedule(imp.rawText, state.activityMapping || {}, weekStartIso ? {
+          weekStartIso
+        } : {});
+        sampleWeeks++;
+        for (const agent of parsed.agents || []) people.add(agent.name || agent.id);
+        for (const rec of parsed.shiftRecords || []) {
+          records.push(Object.assign({}, rec, {
+            personKey: rec.agentName || rec.agentId
+          }));
+        }
+      } catch (err) {
+        // Keep any successfully parsed weeks; the UI reports the actual sample count.
+      }
+    }
+    source = 'all loaded Verint weeks';
+  } else {
+    const rosterAgents = (state && state.agents || []).filter((agent, i) => !imp || importedRowIndexForAgent(state, agent, i) >= 0);
+    for (const agent of rosterAgents) {
+      const personKey = agent.name || agent.id;
+      people.add(personKey);
+      const endMin = timeToIdx(agent.shiftEnd || '17:00') * INTERVAL_MIN % 1440;
+      for (const day of agent.workDays || []) {
+        records.push({
+          personKey,
+          agentId: agent.id,
+          day,
+          endMin
+        });
+      }
+    }
+    sampleWeeks = 1;
+    if (imp) source = 'current imported week (history unavailable)';
+  }
+  const perPerson = new Map();
+  for (const person of people) perPerson.set(person, {
+    saturday: 0,
+    sunday: 0,
+    lateFinish: 0
+  });
+  for (const rec of records) {
+    const key = rec.personKey || rec.agentName || rec.agentId;
+    if (!perPerson.has(key)) perPerson.set(key, {
+      saturday: 0,
+      sunday: 0,
+      lateFinish: 0
+    });
+    const row = perPerson.get(key);
+    if (+rec.day === 5) row.saturday++;
+    if (+rec.day === 6) row.sunday++;
+    if (finishFallsInWindow(rec.endMin, finishStart, finishEnd)) row.lateFinish++;
+  }
+  const monthScale = sampleWeeks > 0 ? 52 / 12 / sampleWeeks : 0;
+  const summarise = key => {
+    const values = Array.from(perPerson.values(), row => row[key] * monthScale);
+    if (!values.length) return {
+      avg: 0,
+      min: 0,
+      max: 0
+    };
+    return {
+      avg: values.reduce((sum, value) => sum + value, 0) / values.length,
+      min: Math.min(...values),
+      max: Math.max(...values)
+    };
+  };
+  return {
+    source,
+    sampleWeeks,
+    employeeCount: perPerson.size,
+    shiftCount: records.length,
+    finishStart: finishStart || '19:00',
+    finishEnd: finishEnd || '00:00',
+    saturday: summarise('saturday'),
+    sunday: summarise('sunday'),
+    lateFinish: summarise('lateFinish')
+  };
+}
 
 function rotationConfig(state) {
   const def = DEFAULT_STATE.rotation;
@@ -10145,6 +10587,7 @@ function parseVerintSchedule(text, activityMapping, opts) {
     const selectedCols = new Set(seWeekCols.get(seSelectedWeekIso) || []);
     const agents = [];
     const grid = [];
+    const shiftRecords = []; // one record per parsed shift assignment in the selected week
     for (let d = 0; d < 7; d++) {
       grid.push([]);
     }
@@ -10162,6 +10605,7 @@ function parseVerintSchedule(text, activityMapping, opts) {
 
       // For each day column, parse the entry
       agentCounter++;
+      const agentId = 'V' + String(agentCounter).padStart(3, '0');
       const agentRows = new Array(7).fill(null).map(() => new Array(INTERVALS_PER_DAY).fill('off'));
       const workDays = [];
       const shiftStarts = []; // For inferring the agent's typical shift start (median)
@@ -10191,6 +10635,14 @@ function parseVerintSchedule(text, activityMapping, opts) {
           warnings.push('Row ' + i + ' "' + name + '" day ' + DAYS[dow] + ': shift "' + cell + '" produced no intervals (zero-length or invalid span) — skipped.');
           continue;
         }
+        shiftRecords.push({
+          agentId,
+          agentName: name,
+          day: dow,
+          startMin: parsed.startMin,
+          endMin: parsed.endMin,
+          endDayOffset: Math.max(0, dayDiff)
+        });
         if (!workDays.includes(dow)) workDays.push(dow);
         shiftStarts.push(parsed.startMin);
         shiftEnds.push(parsed.endMin);
@@ -10222,7 +10674,7 @@ function parseVerintSchedule(text, activityMapping, opts) {
         warnings.push('Agent "' + name + '": no shifts could be parsed for the selected week — imported with no working days.');
       }
       agents.push({
-        id: 'V' + String(agentCounter).padStart(3, '0'),
+        id: agentId,
         name,
         shiftStart: minToTime(sStart),
         shiftEnd: minToTime(sEnd),
@@ -10253,6 +10705,7 @@ function parseVerintSchedule(text, activityMapping, opts) {
       grid,
       discoveredActivities,
       assignmentActivities,
+      shiftRecords,
       warnings,
       dayDates: finalDayDates,
       weeks: seWeeks,
@@ -10295,7 +10748,8 @@ function parseVerintSchedule(text, activityMapping, opts) {
       }, () => new Array(INTERVALS_PER_DAY).fill('off')),
       workDays: new Set(),
       shiftStarts: [],
-      shiftEnds: []
+      shiftEnds: [],
+      shiftRecords: []
     };
     agentsByName.set(name, rec);
     return rec;
@@ -10410,6 +10864,14 @@ function parseVerintSchedule(text, activityMapping, opts) {
         if (written === 0) {
           warnings.push('Row ' + i + ' "' + name + '": shift assignment "' + shiftAssignmentStr + '" produced no intervals — skipped.');
         } else {
+          agent.shiftRecords.push({
+            agentId: agent.id,
+            agentName: agent.name,
+            day: dow0,
+            startMin: parsed.startMin,
+            endMin: parsed.endMin,
+            endDayOffset: Math.max(0, dayDiff)
+          });
           agent.workDays.add(dow0);
           agent.shiftStarts.push(parsed.startMin);
           agent.shiftEnds.push(parsed.endMin);
@@ -10497,6 +10959,7 @@ function parseVerintSchedule(text, activityMapping, opts) {
     grid,
     discoveredActivities,
     assignmentActivities,
+    shiftRecords: Array.from(agentsByName.values()).flatMap(rec => rec.shiftRecords || []),
     warnings,
     dayDates,
     weeks,
@@ -17830,6 +18293,8 @@ function RotationPanel({
   const agents = state.agents || [];
   const rules = Object.assign({}, DEFAULT_STATE.rotation.rules, rot.rules || {});
   const templates = rot.templates && rot.templates.length ? rot.templates : DEFAULT_STATE.rotation.templates;
+  const insightFinishStart = rot.insightFinishStart || DEFAULT_STATE.rotation.insightFinishStart || '19:00';
+  const insightFinishEnd = rot.insightFinishEnd || DEFAULT_STATE.rotation.insightFinishEnd || '00:00';
   const update = patch => setState(Object.assign({}, state, {
     rotation: Object.assign({}, DEFAULT_STATE.rotation, rot, patch)
   }));
@@ -17883,6 +18348,7 @@ function RotationPanel({
     for (let d = 0; d < 7; d++) for (let i = 0; i < INTERVALS_PER_DAY; i++) hrs += grid[d][i] * (INTERVAL_MIN / 60);
     return hrs / rotationConfig(state).fteWeeklyHours;
   }, [state.volume, state.config, rot.fteWeeklyHours]);
+  const rosterInsights = useMemo(() => computeLoadedRosterInsights(state, insightFinishStart, insightFinishEnd), [state.importedSchedule, state.activityMapping, state.agents, insightFinishStart, insightFinishEnd]);
   const exemptCount = agents.filter(a => a.rotationExempt).length;
   const [result, setResult] = useState(null);
   const [showBurden, setShowBurden] = useState(false);
@@ -17987,6 +18453,71 @@ function RotationPanel({
   }, meta));
 
   return h(Fragment, null,
+  // ---------- Evidence from the currently loaded roster ----------
+  h("div", {
+    className: "panel"
+  }, sectionHead("Loaded roster insights", rosterInsights.source + ' · ' + rosterInsights.sampleWeeks + ' week' + (rosterInsights.sampleWeeks === 1 ? '' : 's') + ' · ' + rosterInsights.employeeCount + ' employees'), h("div", {
+    className: "panel-b"
+  }, h("div", {
+    style: {
+      display: 'flex',
+      gap: '10px',
+      alignItems: 'center',
+      flexWrap: 'wrap',
+      marginBottom: '12px',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px'
+    }
+  }, h("span", {
+    style: {
+      color: 'var(--ink-dim)'
+    }
+  }, "Late finish means shift ends between"), h("input", {
+    type: "time",
+    step: 900,
+    value: insightFinishStart,
+    onInput: e => update({
+      insightFinishStart: e.target.value
+    }),
+    title: "Start of the finish-time window"
+  }), h("span", {
+    style: {
+      color: 'var(--ink-faint)'
+    }
+  }, "and"), h("input", {
+    type: "time",
+    step: 900,
+    value: insightFinishEnd,
+    onInput: e => update({
+      insightFinishEnd: e.target.value
+    }),
+    title: "End of the finish-time window. Use 00:00 for midnight; windows can cross midnight."
+  }), h("span", {
+    style: {
+      color: 'var(--ink-faint)',
+      fontSize: '10px'
+    }
+  }, "· inclusive · can cross midnight")), rosterInsights.employeeCount === 0 ? h("div", {
+    style: {
+      color: 'var(--ink-faint)',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px'
+    }
+  }, "No loaded roster assignments are available to analyse.") : h(Fragment, null, h("div", {
+    style: {
+      display: 'flex',
+      gap: '8px',
+      flexWrap: 'wrap',
+      marginBottom: '10px'
+    }
+  }, chip('Saturdays / employee / month', fmt1(rosterInsights.saturday.avg), undefined, 'Observed employee range: ' + fmt1(rosterInsights.saturday.min) + '–' + fmt1(rosterInsights.saturday.max) + ' Saturdays/month'), chip('Sundays / employee / month', fmt1(rosterInsights.sunday.avg), undefined, 'Observed employee range: ' + fmt1(rosterInsights.sunday.min) + '–' + fmt1(rosterInsights.sunday.max) + ' Sundays/month'), chip('Finishes ' + insightFinishStart + '–' + insightFinishEnd + ' / month', fmt1(rosterInsights.lateFinish.avg), undefined, 'Observed employee range: ' + fmt1(rosterInsights.lateFinish.min) + '–' + fmt1(rosterInsights.lateFinish.max) + ' matching finishes/month')), h("div", {
+    style: {
+      color: 'var(--ink-dim)',
+      fontFamily: 'var(--mono)',
+      fontSize: '10px',
+      lineHeight: 1.5
+    }
+  }, "Based on ", rosterInsights.shiftCount, " actual shift assignment", rosterInsights.shiftCount === 1 ? '' : 's', ". Weekly observations are normalised using 52 ÷ 12 = 4.33 weeks per month; hover a metric to see the observed employee range.", state.importedSchedule && h("span", null, " Scenario-added staff are excluded so this remains a view of the loaded Verint evidence."))))),
   // ---------- Pool + rules + templates ----------
   h("div", {
     className: "panel"
@@ -23536,6 +24067,248 @@ function SummaryStrip({
       whiteSpace: 'nowrap'
     }
   }, "as of ", refreshedStr));
+}
+
+function MonthsAheadPanel({
+  state,
+  setState,
+  grid,
+  availability
+}) {
+  const forecast = useMemo(() => computeMonthsAheadForecast(state, grid, availability), [state, grid, availability]);
+  const plan = forecast.plan;
+  const months = forecast.months;
+  const last = months[months.length - 1];
+  const e = React.createElement;
+  const updatePlan = patch => setState(prev => Object.assign({}, prev, {
+    monthsAhead: Object.assign({}, normaliseMonthsAhead(prev.monthsAhead), patch)
+  }));
+  const updateRow = (index, patch) => setState(prev => {
+    const current = normaliseMonthsAhead(prev.monthsAhead);
+    const rows = current.rows.slice();
+    rows[index] = Object.assign({}, rows[index], patch);
+    return Object.assign({}, prev, {
+      monthsAhead: Object.assign({}, current, {
+        rows
+      })
+    });
+  });
+  const integerEditor = (value, onCommit, width, title) => e(EditableNumberCell, {
+    value,
+    format: v => String(Math.round(+v || 0)),
+    parse: raw => +raw,
+    validate: v => Math.max(0, Math.round(v)),
+    onCommit,
+    width: width || '58px',
+    inputMode: 'numeric',
+    min: 0,
+    step: 1,
+    title
+  });
+  const decimalEditor = (value, onCommit, options) => e(EditableNumberCell, {
+    value,
+    format: v => String(+v || 0),
+    parse: raw => +raw,
+    validate: options && options.validate ? options.validate : v => v,
+    onCommit,
+    width: options && options.width || '70px',
+    inputMode: 'decimal',
+    min: options && options.min,
+    max: options && options.max,
+    step: options && options.step || 1,
+    suffix: options && options.suffix,
+    title: options && options.title
+  });
+  const configField = (label, control, help) => e("div", {
+    style: {
+      minWidth: 0
+    }
+  }, e("div", {
+    style: {
+      fontFamily: 'var(--mono)',
+      fontSize: '10px',
+      textTransform: 'uppercase',
+      letterSpacing: '0.1em',
+      color: 'var(--ink-faint)',
+      marginBottom: '5px'
+    }
+  }, label), control, help && e("div", {
+    style: {
+      fontFamily: 'var(--mono)',
+      fontSize: '9px',
+      lineHeight: 1.45,
+      color: 'var(--ink-faint)',
+      marginTop: '5px'
+    }
+  }, help));
+  const monthLabel = monthIso => {
+    const parts = monthIso.split('-').map(Number);
+    return new Date(parts[0], parts[1] - 1, 1).toLocaleDateString('en-AU', {
+      month: 'short',
+      year: 'numeric'
+    });
+  };
+  const slTone = m => m.sl >= state.config.slTargetPct ? 'good' : m.sl >= state.config.slTargetPct - 0.1 ? 'warn' : 'bad';
+  const asaText = m => m.unstableIntervals > 0 && !isFinite(m.asa) ? '∞' : formatSeconds(m.asa);
+  const th = (label, help, title) => e("th", {
+    title: title || help
+  }, label, help && e("span", {
+    className: "th-help"
+  }, help));
+  return e(Fragment, null, e("div", {
+    className: "panel"
+  }, e("div", {
+    className: "panel-h"
+  }, e("h2", null, "12-month scenario settings"), e("span", {
+    className: "h-meta"
+  }, "Uses the current week's interval shape and queue model")), e("div", {
+    className: "panel-b"
+  }, e("div", {
+    className: "months-ahead-intro"
+  }, e("div", null, e("div", {
+    className: "grid-3"
+  }, configField("First forecast month", e("input", {
+    type: "month",
+    value: plan.startMonth,
+    onChange: event => updatePlan({
+      startMonth: event.target.value
+    }),
+    "aria-label": "First forecast month"
+  }), "The table always shows 12 consecutive calendar months."), configField("Time to train", decimalEditor(plan.trainingWeeks, value => updatePlan({
+    trainingWeeks: value
+  }), {
+    min: 0,
+    step: 0.5,
+    width: '76px',
+    suffix: ' weeks',
+    validate: v => Math.max(0, Math.min(104, v))
+  }), "New hires contribute no floor capacity during training."), configField("Time to proficient", decimalEditor(plan.proficientWeeks, value => updatePlan({
+    proficientWeeks: value
+  }), {
+    min: 0,
+    step: 0.5,
+    width: '76px',
+    suffix: ' weeks',
+    validate: v => Math.max(0, Math.min(104, v))
+  }), "After training, productivity ramps linearly from 50% to 100%.")), e("button", {
+    className: "btn ghost sm",
+    style: {
+      marginTop: '14px'
+    },
+    onClick: () => updatePlan({
+      rows: makeMonthsAheadRows()
+    })
+  }, "Clear monthly changes")), e("div", {
+    className: "months-ahead-note"
+  }, e("strong", {
+    style: {
+      color: 'var(--ink)'
+    }
+  }, "How the simulation works"), e("br"), "Hires start on the first day of their month. Attrition and proficient movements are also applied at month-start. Volume Δ is a permanent weekly call step-change from that month onward; seasonality is a separate multiplier for that month only. Monthly SL, ASA and abandonment are calculated at 15-minute level using the current weekly roster, volume shape, AHT, patience and Erlang model."))), e("div", {
+    className: "stat-strip",
+    style: {
+      marginTop: '16px',
+      marginBottom: 0
+    }
+  }, e(KPI, {
+    label: "Current people",
+    value: forecast.baselineHeadcount,
+    sub: forecast.baselineEffectiveFTE.toFixed(1) + ' effective floor FTE in the baseline week'
+  }), e(KPI, {
+    label: "Baseline volume",
+    value: Math.round(forecast.baselineWeeklyVolume).toLocaleString(),
+    sub: 'offered calls per current week'
+  }), e(KPI, {
+    label: "Month 12 people",
+    value: last.staffHeadcount,
+    sub: last.floorFTE.toFixed(1) + ' effective floor FTE'
+  }), e(KPI, {
+    label: "Month 12 SLA",
+    value: (last.sl * 100).toFixed(1),
+    unit: "%",
+    sub: asaText(last) + ' ASA · ' + (last.abandonPct * 100).toFixed(1) + '% abandon',
+    tone: slTone(last)
+  })))), e("div", {
+    className: "panel"
+  }, e("div", {
+    className: "panel-h"
+  }, e("h2", null, "Service trajectory"), e("span", {
+    className: "h-meta"
+  }, "SLA · mean stable-interval ASA")), e("div", {
+    className: "panel-b",
+    style: {
+      overflowX: 'auto'
+    }
+  }, e("div", {
+    className: "months-ahead-trajectory"
+  }, months.map(month => e("div", {
+    className: "months-ahead-tile " + slTone(month),
+    key: month.monthIso,
+    title: monthLabel(month.monthIso) + ': ' + month.staffHeadcount + ' people, ' + month.floorFTE.toFixed(1) + ' floor FTE, ' + Math.round(month.weeklyVolume).toLocaleString() + ' calls/week'
+  }, e("div", {
+    className: "month"
+  }, monthLabel(month.monthIso).replace(' ', ' ’')), e("div", {
+    className: "sl"
+  }, (month.sl * 100).toFixed(0), "%"), e("div", {
+    className: "asa"
+  }, asaText(month), month.unstableIntervals > 0 ? ' · overloaded' : ' ASA')))))), e("div", {
+    className: "panel"
+  }, e("div", {
+    className: "panel-h"
+  }, e("h2", null, "Monthly plan and forecast"), e("span", {
+    className: "h-meta"
+  }, "Positive / negative demand and staffing scenarios update instantly")), e("div", {
+    className: "months-ahead-table-wrap"
+  }, e("table", {
+    className: "data months-ahead"
+  }, e("thead", null, e("tr", null, th("Month"), th("Hires", "new starters"), th("Attrition", "proficient out"), th("Manual in", "proficient in"), th("Manual out", "proficient out"), th("Volume Δ", "calls/week · lasting", "Signed change to weekly offered calls, carried into every following month"), th("Seasonality", "this month only"), th("People", "month-end HC"), th("Floor FTE", "avg productive"), th("Volume", "calls/week"), th("SLA", "within target"), th("ASA", "mean"), th("Abandonment", "% · calls/month"))), e("tbody", null, months.map((month, index) => {
+    const row = plan.rows[index];
+    return e("tr", {
+      key: month.monthIso
+    }, e("td", {
+      className: "month-name"
+    }, monthLabel(month.monthIso)), e("td", null, integerEditor(row.hires, value => updateRow(index, {
+      hires: value
+    }), '54px', 'Hires starting at the beginning of this month')), e("td", null, integerEditor(row.attrition, value => updateRow(index, {
+      attrition: value
+    }), '54px', 'Forecast attrition effective from the beginning of this month')), e("td", null, integerEditor(row.manualIn, value => updateRow(index, {
+      manualIn: value
+    }), '54px', 'Proficient people joining from outside the team')), e("td", null, integerEditor(row.manualOut, value => updateRow(index, {
+      manualOut: value
+    }), '54px', 'Proficient people manually moved out of the team')), e("td", null, decimalEditor(row.volumeDelta, value => updateRow(index, {
+      volumeDelta: value
+    }), {
+      width: '78px',
+      step: 100,
+      validate: v => Math.round(v),
+      title: 'Signed weekly call change from this month onward, e.g. 500 or -300'
+    })), e("td", null, decimalEditor(row.seasonalityPct, value => updateRow(index, {
+      seasonalityPct: value
+    }), {
+      width: '62px',
+      min: 0,
+      max: 500,
+      step: 5,
+      suffix: '%',
+      validate: v => Math.max(0, Math.min(500, v)),
+      title: 'Month-only demand multiplier; 100% means no seasonal change'
+    })), e("td", null, month.staffHeadcount), e("td", {
+      title: month.hireFloorFTE.toFixed(2) + ' effective FTE from hire cohorts'
+    }, month.floorFTE.toFixed(1)), e("td", null, Math.round(month.weeklyVolume).toLocaleString()), e("td", {
+      style: {
+        color: slTone(month) === 'good' ? 'var(--good)' : slTone(month) === 'warn' ? 'var(--warn)' : 'var(--bad)',
+        fontWeight: 600
+      }
+    }, (month.sl * 100).toFixed(1), "%"), e("td", null, asaText(month), month.unstableIntervals > 0 && e("div", {
+      style: {
+        color: 'var(--bad)',
+        fontSize: '8px',
+        marginTop: '2px'
+      }
+    }, month.unstableIntervals, " overloaded int.")), e("td", {
+      title: Math.round(month.monthlyAbandoned).toLocaleString() + ' forecast abandoned calls in this calendar month'
+    }, (month.abandonPct * 100).toFixed(1), "% · ", Math.round(month.monthlyAbandoned).toLocaleString()));
+  })))));
 }
 
 // ============================================================================
@@ -30260,6 +31033,10 @@ function App() {
     className: tab === 'analysis' ? 'active' : '',
     onClick: () => setTab('analysis')
   }, "Result Analysis"), /*#__PURE__*/React.createElement("button", {
+    className: tab === 'monthsAhead' ? 'active' : '',
+    onClick: () => setTab('monthsAhead'),
+    title: "Project hires, training ramps, proficiency, attrition, team movements, seasonality and volume changes across the next 12 months"
+  }, "Months Ahead"), /*#__PURE__*/React.createElement("button", {
     className: tab === 'backoffice' ? 'active' : '',
     onClick: () => setTab('backoffice'),
     title: "For desks where agents split time between phones and admin work. Computes how much agent-time is left for back-office WIP after the call queue takes its share at target occupancy."
@@ -30383,7 +31160,12 @@ function App() {
   }), /*#__PURE__*/React.createElement(IntervalTable, {
     state: state,
     sla: sla
-  })), tab === 'backoffice' && /*#__PURE__*/React.createElement(BackOfficePanel, {
+  })), tab === 'monthsAhead' && /*#__PURE__*/React.createElement(MonthsAheadPanel, {
+    state: state,
+    setState: setState,
+    grid: grid,
+    availability: availability
+  }), tab === 'backoffice' && /*#__PURE__*/React.createElement(BackOfficePanel, {
     state: state,
     setState: setState,
     grid: grid

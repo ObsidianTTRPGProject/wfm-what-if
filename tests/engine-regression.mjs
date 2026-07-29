@@ -52,6 +52,63 @@ vm.runInContext(main, context, { filename: 'index.html', timeout: 10_000 });
 const get = name => vm.runInContext(name, context);
 const cloneDefault = () => vm.runInContext('JSON.parse(JSON.stringify(DEFAULT_STATE))', context);
 
+// Months Ahead: the 12-month model must preserve the weekly baseline, apply workforce
+// lifecycle timing, carry permanent volume changes forward, and keep seasonality month-only.
+const makeMonthsAheadRows = get('makeMonthsAheadRows');
+const nextCalendarMonthIso = get('nextCalendarMonthIso');
+const averageCohortProductivity = get('averageCohortProductivity');
+const computeMonthsAheadForecast = get('computeMonthsAheadForecast');
+const buildFullScheduleForMonths = get('buildFullSchedule');
+const computeAvailabilityForMonths = get('computeAvailability');
+const monthRows = makeMonthsAheadRows();
+assert.equal(monthRows.length, 12);
+assert.ok(monthRows.every(row => row.seasonalityPct === 100), 'seasonality must default to a neutral 100%');
+assert.equal(nextCalendarMonthIso(new Date(2026, 6, 30, 12)), '2026-08', 'default month must use the local calendar rather than UTC month boundaries');
+const firstMonthRamp = averageCohortProductivity(0, 0, '2026-08', 4, 8);
+assert.ok(firstMonthRamp > 0 && firstMonthRamp < 0.1, 'a four-week training period should leave only a small end-of-month floor contribution');
+assert.equal(averageCohortProductivity(0, 0, '2026-08', 100, 8), 0, 'hires must remain fully off-floor during training');
+assert.equal(averageCohortProductivity(0, 6, '2026-08', 4, 8), 1, 'a completed cohort must reach full productivity');
+
+const monthsState = cloneDefault();
+monthsState.monthsAhead = {
+  startMonth: '2026-08',
+  trainingWeeks: 4,
+  proficientWeeks: 8,
+  rows: makeMonthsAheadRows()
+};
+monthsState.monthsAhead.rows[0].hires = 10;
+monthsState.monthsAhead.rows[1].attrition = 2;
+monthsState.monthsAhead.rows[2].manualIn = 3;
+monthsState.monthsAhead.rows[3].manualOut = 1;
+monthsState.monthsAhead.rows[4].volumeDelta = 500;
+monthsState.monthsAhead.rows[5].seasonalityPct = 120;
+const monthsSchedule = buildFullScheduleForMonths(monthsState);
+const monthsAvailability = computeAvailabilityForMonths(monthsSchedule.grid, monthsState.agents);
+const monthsForecast = computeMonthsAheadForecast(monthsState, monthsSchedule.grid, monthsAvailability);
+assert.equal(monthsForecast.months.length, 12);
+assert.equal(monthsForecast.months[0].staffHeadcount, 25, 'hires start at the beginning of their selected month');
+assert.equal(monthsForecast.months[1].staffHeadcount, 23, 'monthly attrition must reduce projected headcount');
+assert.equal(monthsForecast.months[2].staffHeadcount, 26, 'manual joins must enter as proficient headcount');
+assert.equal(monthsForecast.months[3].staffHeadcount, 25, 'manual exits must reduce projected headcount');
+assert.ok(monthsForecast.months[0].floorFTE < monthsForecast.months[0].staffHeadcount, 'training and proficiency ramp must separate floor FTE from payroll headcount');
+assert.ok(Math.abs(monthsForecast.months[4].weeklyVolume - (monthsForecast.baselineWeeklyVolume + 500)) < 1e-6, 'volume step-change must start in the selected month');
+assert.ok(Math.abs(monthsForecast.months[5].weeklyVolume - (monthsForecast.baselineWeeklyVolume + 500) * 1.2) < 1e-6, 'seasonality must multiply the month after permanent volume changes');
+assert.ok(Math.abs(monthsForecast.months[6].weeklyVolume - (monthsForecast.baselineWeeklyVolume + 500)) < 1e-6, 'seasonality must not leak into following months');
+assert.ok(monthsForecast.months.every(month => Number.isFinite(month.sl) && Number.isFinite(month.abandonPct)), 'every month needs a usable SLA and abandonment forecast');
+const noStaffState = cloneDefault();
+noStaffState.monthsAhead = {
+  startMonth: '2026-08',
+  trainingWeeks: 4,
+  proficientWeeks: 8,
+  rows: makeMonthsAheadRows()
+};
+noStaffState.monthsAhead.rows[0].manualOut = noStaffState.agents.length;
+const noStaffSchedule = buildFullScheduleForMonths(noStaffState);
+const noStaffAvailability = computeAvailabilityForMonths(noStaffSchedule.grid, noStaffState.agents);
+const noStaffForecast = computeMonthsAheadForecast(noStaffState, noStaffSchedule.grid, noStaffAvailability);
+assert.equal(noStaffForecast.months[0].staffHeadcount, 0);
+assert.equal(noStaffForecast.months[0].abandonPct, 1, 'Erlang C abandonment overlay must forecast all offered calls abandoning when no staff remain');
+
 const averageGrids = get('averageGrids');
 const mkGrid = code => Array.from({ length: 7 }, () => [new Array(96).fill(code)]);
 const mixed = averageGrids([mkGrid('work'), mkGrid('break')]);
@@ -77,6 +134,7 @@ assert.match(redactedStartEnd, /Verint-Import-01/);
 assert.match(redactedStartEnd, /Verint-Import-02/);
 const parsedRedactedStartEnd = parseVerintSchedule(startEndWithNames);
 assert.deepEqual(Array.from(parsedRedactedStartEnd.agents, a => a.name), ['Verint-Import-01', 'Verint-Import-02']);
+assert.equal(parsedRedactedStartEnd.shiftRecords.length, 4, 'start/end imports must expose one insight record per actual shift');
 
 const activitiesWithNames = [
   'Name,Scheduled SP Draft Hours,Start Date,Scheduling Period,Before Overtime,After Overtime,Shift Assignment,Shift Events',
@@ -91,6 +149,35 @@ assert.ok(!redactedActivities.includes('Jane Doe'), 'activity exports must redac
 assert.equal((redactedActivities.match(/Verint-Import-01/g) || []).length, 2, 'the same employee must keep one placeholder across date sections');
 const parsedRedactedActivities = parseVerintSchedule(activitiesWithNames);
 assert.deepEqual(Array.from(parsedRedactedActivities.agents, a => a.name), ['Verint-Import-01', 'Verint-Import-02']);
+assert.equal(parsedRedactedActivities.shiftRecords.length, 3, 'activity imports must expose assignment records without counting shift events');
+
+const computeLoadedRosterInsights = get('computeLoadedRosterInsights');
+const multiWeekWeekendRoster = [
+  'Name,Start Date,01/08/2026,02/08/2026,08/08/2026,09/08/2026',
+  'Jane Doe,01/08/2026,Late 01/08/2026 12:00 PM-01/08/2026 8:00 PM,Late 02/08/2026 12:00 PM-02/08/2026 8:00 PM,Late 08/08/2026 12:00 PM-08/08/2026 8:00 PM,Late 09/08/2026 12:00 PM-09/08/2026 8:00 PM',
+  'John Smith,01/08/2026,Day 01/08/2026 9:00 AM-01/08/2026 5:00 PM,Off,Day 08/08/2026 9:00 AM-08/08/2026 5:00 PM,Off'
+].join('\n');
+const parsedWeekendRoster = parseVerintSchedule(multiWeekWeekendRoster);
+const weekendInsightState = cloneDefault();
+weekendInsightState.agents = parsedWeekendRoster.agents;
+weekendInsightState.importedSchedule = {
+  rawText: redactVerintScheduleText(multiWeekWeekendRoster),
+  grid: parsedWeekendRoster.grid,
+  agentCount: parsedWeekendRoster.agents.length,
+  agentIds: parsedWeekendRoster.agents.map(a => a.id),
+  weeks: parsedWeekendRoster.weeks,
+  selectedWeekIso: parsedWeekendRoster.selectedWeekIso
+};
+const weekendInsights = computeLoadedRosterInsights(weekendInsightState, '19:00', '00:00');
+assert.equal(weekendInsights.sampleWeeks, 2, 'roster insights must analyse every loaded Verint week');
+assert.equal(weekendInsights.employeeCount, 2);
+assert.equal(weekendInsights.shiftCount, 6);
+assert.ok(Math.abs(weekendInsights.saturday.avg - 52 / 12) < 1e-8, 'two sampled Saturdays per employee must normalise to 4.33/month');
+assert.ok(Math.abs(weekendInsights.sunday.avg - 52 / 24) < 1e-8, 'one of two employees working Sunday must average 2.17/month');
+assert.ok(Math.abs(weekendInsights.lateFinish.avg - 52 / 12) < 1e-8, 'actual 20:00 finishes across both weeks must feed the monthly average');
+const finishFallsInWindow = get('finishFallsInWindow');
+assert.equal(finishFallsInWindow(60, '19:00', '02:00'), true, 'finish windows may cross midnight');
+assert.equal(finishFallsInWindow(360, '19:00', '02:00'), false, 'cross-midnight windows must exclude later morning finishes');
 
 const anonymizeImportedScheduleState = get('anonymizeImportedScheduleState');
 const legacyNamedState = cloneDefault();
