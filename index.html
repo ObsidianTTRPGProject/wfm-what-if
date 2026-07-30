@@ -719,6 +719,26 @@ const LAST_SEEN_VERSION_KEY = 'wfm-last-seen-version';
 // `tag` is one of 'feat' (new feature), 'fix' (bug fix), 'change' (behaviour change),
 // 'ui' (visual/interaction tweak). Plain strings default to 'feat'.
 const CHANGELOG = [{
+  version: '0.43.0',
+  date: '2026-07-31',
+  title: 'Monthly results import and shrinkage planning',
+  changes: [{
+    tag: 'feat',
+    text: 'Months Ahead can now import Excel monthly-results exports using Month, Calls Offered, and Shrinkage %. Historical calls are converted into day-count-adjusted seasonal run rates and mapped to matching forecast calendar months.'
+  }, {
+    tag: 'feat',
+    text: 'Each forecast month now has editable Calls Offered, Seasonality, and Shrinkage assumptions. Editing calls automatically recalculates the seasonal factor, while the seasonal percentage remains available for direct scenario adjustments.'
+  }, {
+    tag: 'change',
+    text: 'Monthly shrinkage expectations now scale productive floor capacity relative to the current roster and downtime baseline, flowing through SLA, ASA, abandonment, and Floor FTE forecasts.'
+  }, {
+    tag: 'fix',
+    text: 'The importer accepts real Excel dates or common month text, decimal or whole-number percentages, and the source export’s misspelled component shrinkage headers. Placeholder month labels are rejected with a clear correction message.'
+  }, {
+    tag: 'change',
+    text: 'Regression coverage verifies calendar-month mapping, day-count-normalised seasonality, total and component shrinkage imports, and the service impact of higher monthly shrinkage.'
+  }]
+}, {
   version: '0.42.0',
   date: '2026-07-30',
   title: 'Backlog-aware ASA forecasting',
@@ -5826,7 +5846,10 @@ function makeMonthsAheadRows() {
     manualIn: 0,
     manualOut: 0,
     volumeDelta: 0,
-    seasonalityPct: 100
+    seasonalityPct: 100,
+    callsOffered: null,
+    shrinkagePct: null,
+    sourceMonth: null
   }));
 }
 function makeDefaultMonthsAhead() {
@@ -5848,13 +5871,18 @@ function normaliseMonthsAhead(value) {
       manualIn: Math.max(0, Math.round(+incoming.manualIn || 0)),
       manualOut: Math.max(0, Math.round(+incoming.manualOut || 0)),
       volumeDelta: isFinite(+incoming.volumeDelta) ? +incoming.volumeDelta : 0,
-      seasonalityPct: isFinite(+incoming.seasonalityPct) ? Math.max(0, +incoming.seasonalityPct) : 100
+      seasonalityPct: isFinite(+incoming.seasonalityPct) ? Math.max(0, +incoming.seasonalityPct) : 100,
+      callsOffered: incoming.callsOffered !== null && incoming.callsOffered !== undefined && isFinite(+incoming.callsOffered) ? Math.max(0, +incoming.callsOffered) : null,
+      shrinkagePct: incoming.shrinkagePct !== null && incoming.shrinkagePct !== undefined && isFinite(+incoming.shrinkagePct) ? Math.max(0, Math.min(100, +incoming.shrinkagePct)) : null,
+      sourceMonth: /^\d{4}-\d{2}$/.test(incoming.sourceMonth || '') ? incoming.sourceMonth : null
     });
   });
   return {
     startMonth: /^\d{4}-\d{2}$/.test(source.startMonth || '') ? source.startMonth : base.startMonth,
     trainingWeeks: Math.max(0, +source.trainingWeeks || 0),
     proficientWeeks: Math.max(0, +source.proficientWeeks || 0),
+    seasonalityBaselineWeekly: isFinite(+source.seasonalityBaselineWeekly) && +source.seasonalityBaselineWeekly > 0 ? +source.seasonalityBaselineWeekly : null,
+    importSummary: source.importSummary || null,
     rows
   };
 }
@@ -5871,6 +5899,129 @@ function monthIsoAt(startMonth, offset) {
 function daysInMonthIso(monthIso) {
   const d = monthDateAt(monthIso, 0);
   return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+}
+function parseMonthlyMonth(XLSX, raw) {
+  let d = null;
+  if (raw instanceof Date && !isNaN(raw.getTime())) {
+    d = raw;
+  } else if (typeof raw === 'number' && XLSX && XLSX.SSF && XLSX.SSF.parse_date_code) {
+    const parsed = XLSX.SSF.parse_date_code(raw);
+    if (parsed) d = new Date(parsed.y, parsed.m - 1, parsed.d || 1);
+  } else {
+    const text = String(raw || '').trim();
+    if (!text || /^m{3,}\s*y{2,4}$/i.test(text)) return null;
+    let match = /^(\d{4})[-/](\d{1,2})(?:[-/]\d{1,2})?$/.exec(text);
+    if (match) {
+      d = new Date(+match[1], +match[2] - 1, 1);
+    } else {
+      match = /^(\d{1,2})[-/](\d{4})$/.exec(text);
+      if (match) d = new Date(+match[2], +match[1] - 1, 1);else {
+        const parsed = new Date('1 ' + text.replace(/-/g, ' '));
+        if (!isNaN(parsed.getTime())) d = parsed;
+      }
+    }
+  }
+  if (!d || isNaN(d.getTime())) return null;
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+}
+function parseMonthlyPercent(raw) {
+  if (raw === null || raw === undefined || raw === '' || !isFinite(+raw)) return null;
+  const value = +raw;
+  return Math.max(0, Math.min(100, Math.abs(value) <= 1.5 ? value * 100 : value));
+}
+function parseMonthsAheadXLSX(XLSX, arrayBuffer) {
+  const wb = XLSX.read(arrayBuffer, {
+    type: 'array',
+    cellDates: true
+  });
+  const sheetName = wb.SheetNames.find(name => /export|month/i.test(name)) || wb.SheetNames[0];
+  const sheet = wb.Sheets[sheetName];
+  if (!sheet) throw new Error('No sheets found in workbook');
+  const rows = XLSX.utils.sheet_to_json(sheet, {
+    defval: null,
+    raw: true
+  });
+  if (!rows.length) throw new Error('Sheet appears empty');
+  const normaliseHeader = value => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const firstKey = (sample, aliases) => {
+    const wanted = aliases.map(normaliseHeader);
+    return Object.keys(sample).find(key => wanted.includes(normaliseHeader(key))) || null;
+  };
+  const sample = rows[0];
+  const monthKey = firstKey(sample, ['Month', 'Calendar Month', 'Reporting Month', 'Date']);
+  const callsKey = firstKey(sample, ['Calls Offered', 'Offered Calls', 'CallsOffered', 'Offered', 'Volume']);
+  const shrinkageKey = firstKey(sample, ['Shrinkage %', 'Shrinkage', 'Total Shrinkage %', 'Total Shrinkage']);
+  const componentKeys = [
+    firstKey(sample, ['Shrinkage % (Div)', 'hrinkage % (Div)', 'Shrinkage Div']),
+    firstKey(sample, ['Shrinkage % (Downtime)', 'hrinkage % (Downtime)', 'Shrinkage Downtime']),
+    firstKey(sample, ['Shrinkage % (PL)', 'hrinkage % (PL)', 'Shrinkage PL']),
+    firstKey(sample, ['Shrinkage % (UPL)', 'hrinkage % (UPL)', 'Shrinkage UPL'])
+  ].filter(Boolean);
+  if (!monthKey || !callsKey) {
+    throw new Error('Could not find required columns. Need Month and Calls Offered. Got: ' + Object.keys(sample).join(', '));
+  }
+  const out = [];
+  for (const row of rows) {
+    const monthIso = parseMonthlyMonth(XLSX, row[monthKey]);
+    if (!monthIso) continue;
+    const calls = row[callsKey] !== null && row[callsKey] !== undefined && row[callsKey] !== '' && isFinite(+row[callsKey]) ? Math.max(0, +row[callsKey]) : null;
+    let shrinkagePct = shrinkageKey ? parseMonthlyPercent(row[shrinkageKey]) : null;
+    if (shrinkagePct === null && componentKeys.length) {
+      const components = componentKeys.map(key => parseMonthlyPercent(row[key])).filter(value => value !== null);
+      if (components.length) shrinkagePct = Math.min(100, components.reduce((sum, value) => sum + value, 0));
+    }
+    if (calls === null && shrinkagePct === null) continue;
+    out.push({
+      monthIso,
+      callsOffered: calls,
+      shrinkagePct
+    });
+  }
+  if (!out.length) {
+    throw new Error('No valid monthly rows found. Replace placeholder month labels such as "mmmm YY" with real months before importing.');
+  }
+  return out.sort((a, b) => a.monthIso.localeCompare(b.monthIso));
+}
+function monthlySeasonalityFromCalls(callsOffered, monthIso, baselineWeekly) {
+  if (!(baselineWeekly > 0) || callsOffered === null || callsOffered === undefined || !isFinite(+callsOffered)) return 100;
+  const weeklyRunRate = Math.max(0, +callsOffered) * 7 / daysInMonthIso(monthIso);
+  return Math.max(0, weeklyRunRate / baselineWeekly * 100);
+}
+function applyMonthlyResultsToPlan(value, importedRows) {
+  const plan = normaliseMonthsAhead(value);
+  const usableCalls = importedRows.filter(row => row.callsOffered !== null && row.callsOffered !== undefined && isFinite(+row.callsOffered));
+  const baselineWeekly = usableCalls.length ? usableCalls.reduce((sum, row) => sum + Math.max(0, +row.callsOffered) * 7 / daysInMonthIso(row.monthIso), 0) / usableCalls.length : plan.seasonalityBaselineWeekly;
+  const byCalendarMonth = new Map();
+  for (const row of importedRows) {
+    const monthNumber = +row.monthIso.slice(5, 7);
+    byCalendarMonth.set(monthNumber, row);
+  }
+  const clearedRows = plan.rows.map(row => row.sourceMonth ? Object.assign({}, row, {
+    callsOffered: null,
+    shrinkagePct: null,
+    sourceMonth: null,
+    seasonalityPct: 100
+  }) : row);
+  const rows = clearedRows.map((row, index) => {
+    const targetMonth = monthIsoAt(plan.startMonth, index);
+    const source = byCalendarMonth.get(+targetMonth.slice(5, 7));
+    if (!source) return row;
+    return Object.assign({}, row, {
+      callsOffered: source.callsOffered,
+      shrinkagePct: source.shrinkagePct,
+      sourceMonth: source.monthIso,
+      seasonalityPct: source.callsOffered !== null && baselineWeekly > 0 ? monthlySeasonalityFromCalls(source.callsOffered, source.monthIso, baselineWeekly) : row.seasonalityPct
+    });
+  });
+  return Object.assign({}, plan, {
+    rows,
+    seasonalityBaselineWeekly: baselineWeekly > 0 ? baselineWeekly : null,
+    importSummary: {
+      rows: importedRows.length,
+      firstMonth: importedRows[0].monthIso,
+      lastMonth: importedRows[importedRows.length - 1].monthIso
+    }
+  });
 }
 function weeklyOpenVolume(volume, config) {
   let total = 0;
@@ -5978,6 +6129,16 @@ function computeMonthsAheadForecast(state, grid, baselineAvailability) {
   let perHeadAvailability = fullGrid.map(row => row.map(v => baselineHeadcount > 0 ? v / baselineHeadcount : 0));
   let perHeadHours = perHeadAvailability.reduce((sum, row) => sum + row.reduce((s, v) => s + v, 0), 0);
   let baselineHours = baselineAvailability.reduce((sum, row) => sum + row.reduce((s, v) => s + v, 0), 0);
+  let scheduledIntervals = 0;
+  for (let d = 0; d < 7; d++) {
+    const dayGrid = grid[d] || [];
+    for (const agentRow of dayGrid) {
+      for (let i = 0; i < INTERVALS_PER_DAY; i++) {
+        const cell = agentRow && agentRow[i];
+        if (cell && cell !== 'off') scheduledIntervals++;
+      }
+    }
+  }
 
   // If the current scenario has no agents, create a reasonable one-person weekly shape from
   // the configured desk hours. This keeps future hires useful instead of projecting zero
@@ -5997,6 +6158,9 @@ function computeMonthsAheadForecast(state, grid, baselineAvailability) {
     baselineHours = 0;
   }
   const baselineEffectiveFTE = perHeadHours > 0 ? baselineHours / perHeadHours : baselineHeadcount;
+  const downtimeFactor = 1 - Math.max(0, Math.min(50, state.config.downtimePct || 0)) / 100;
+  const baselineProductiveIntervals = baselineHours * downtimeFactor;
+  const baselineShrinkageFrac = scheduledIntervals > 0 ? Math.max(0, Math.min(0.99, 1 - baselineProductiveIntervals / scheduledIntervals)) : Math.max(0, Math.min(0.99, (+state.config.shrinkageTargetPct || 0) / 100));
   const baselineWeeklyVolume = weeklyOpenVolume(state.volume, state.config);
   let cumulativeHires = 0,
     cumulativeAttrition = 0,
@@ -6021,9 +6185,15 @@ function computeMonthsAheadForecast(state, grid, baselineAvailability) {
     for (const cohort of cohorts) {
       hireFloorFTE += cohort.count * averageCohortProductivity(cohort.monthIndex, monthIndex, plan.startMonth, plan.trainingWeeks, plan.proficientWeeks);
     }
-    const projectedFloorFTE = Math.max(0, Math.min(staffHeadcount, baselineEffectiveFTE + cumulativeManualIn - cumulativeManualOut - cumulativeAttrition + hireFloorFTE));
-    const capacityDelta = projectedFloorFTE - baselineEffectiveFTE;
-    const monthAvailability = baselineAvailability.map((dayRow, d) => dayRow.map((value, i) => Math.max(0, value + perHeadAvailability[d][i] * capacityDelta)));
+    const preMonthlyShrinkageFTE = Math.max(0, Math.min(staffHeadcount, baselineEffectiveFTE + cumulativeManualIn - cumulativeManualOut - cumulativeAttrition + hireFloorFTE));
+    const targetShrinkageFrac = row.shrinkagePct === null || row.shrinkagePct === undefined ? baselineShrinkageFrac : Math.max(0, Math.min(0.99, row.shrinkagePct / 100));
+    const shrinkageAdjustment = (1 - targetShrinkageFrac) / Math.max(0.01, 1 - baselineShrinkageFrac);
+    const projectedFloorFTE = Math.max(0, Math.min(staffHeadcount, preMonthlyShrinkageFTE * shrinkageAdjustment));
+    const capacityDelta = preMonthlyShrinkageFTE - baselineEffectiveFTE;
+    const monthAvailability = baselineAvailability.map((dayRow, d) => dayRow.map((value, i) => {
+      const beforeMonthlyShrinkage = Math.max(0, value + perHeadAvailability[d][i] * capacityDelta);
+      return Math.max(0, Math.min(staffHeadcount, beforeMonthlyShrinkage * shrinkageAdjustment));
+    }));
     const seasonality = Math.max(0, row.seasonalityPct) / 100;
     const preSeasonWeeklyVolume = Math.max(0, baselineWeeklyVolume + cumulativeVolumeDelta);
     const weeklyVolume = preSeasonWeeklyVolume * seasonality;
@@ -6037,11 +6207,13 @@ function computeMonthsAheadForecast(state, grid, baselineAvailability) {
       monthIso,
       staffHeadcount,
       floorFTE: projectedFloorFTE,
+      preShrinkageFloorFTE: preMonthlyShrinkageFTE,
       hireFloorFTE,
       weeklyVolume,
       monthlyCalls: metrics.calls * calendarFactor,
       monthlyAbandoned: metrics.abandoned * calendarFactor,
       seasonalityPct: row.seasonalityPct,
+      shrinkagePct: targetShrinkageFrac * 100,
       cumulativeVolumeDelta
     }));
   }
@@ -6049,6 +6221,7 @@ function computeMonthsAheadForecast(state, grid, baselineAvailability) {
     plan,
     baselineHeadcount,
     baselineEffectiveFTE,
+    baselineShrinkagePct: baselineShrinkageFrac * 100,
     baselineWeeklyVolume,
     months: out
   };
@@ -24253,6 +24426,7 @@ function MonthsAheadPanel({
   grid,
   availability
 }) {
+  const [importStatus, setImportStatus] = useState(null);
   const forecast = useMemo(() => computeMonthsAheadForecast(state, grid, availability), [state, grid, availability]);
   const plan = forecast.plan;
   const months = forecast.months;
@@ -24271,6 +24445,47 @@ function MonthsAheadPanel({
       })
     });
   });
+  const updateCallsOffered = (index, value) => setState(prev => {
+    const current = normaliseMonthsAhead(prev.monthsAhead);
+    const rows = current.rows.slice();
+    const monthIso = monthIsoAt(current.startMonth, index);
+    const baselineWeekly = current.seasonalityBaselineWeekly || forecast.baselineWeeklyVolume;
+    rows[index] = Object.assign({}, rows[index], {
+      callsOffered: value,
+      sourceMonth: value === null ? null : rows[index].sourceMonth,
+      seasonalityPct: value === null ? rows[index].seasonalityPct : monthlySeasonalityFromCalls(value, monthIso, baselineWeekly)
+    });
+    return Object.assign({}, prev, {
+      monthsAhead: Object.assign({}, current, {
+        rows
+      })
+    });
+  });
+  const handleMonthlyImport = async event => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = '';
+    if (!file) return;
+    setImportStatus({
+      type: 'info',
+      message: 'Reading monthly results...'
+    });
+    try {
+      const XLSX = await loadXLSX();
+      const imported = parseMonthsAheadXLSX(XLSX, await file.arrayBuffer());
+      setState(prev => Object.assign({}, prev, {
+        monthsAhead: applyMonthlyResultsToPlan(prev.monthsAhead, imported)
+      }));
+      setImportStatus({
+        type: 'good',
+        message: 'Imported ' + imported.length + ' monthly result' + (imported.length === 1 ? '' : 's') + ' from ' + imported[0].monthIso + ' to ' + imported[imported.length - 1].monthIso + '. Calls, seasonality and shrinkage remain editable below.'
+      });
+    } catch (err) {
+      setImportStatus({
+        type: 'bad',
+        message: 'Import failed: ' + (err.message || err)
+      });
+    }
+  };
   const integerEditor = (value, onCommit, width, title) => e(EditableNumberCell, {
     value,
     format: v => String(Math.round(+v || 0)),
@@ -24285,7 +24500,7 @@ function MonthsAheadPanel({
   });
   const decimalEditor = (value, onCommit, options) => e(EditableNumberCell, {
     value,
-    format: v => String(+v || 0),
+    format: options && options.format ? options.format : v => String(+v || 0),
     parse: raw => +raw,
     validate: options && options.validate ? options.validate : v => v,
     onCommit,
@@ -24294,6 +24509,7 @@ function MonthsAheadPanel({
     min: options && options.min,
     max: options && options.max,
     step: options && options.step || 1,
+    allowClear: options && options.allowClear || false,
     suffix: options && options.suffix,
     title: options && options.title
   });
@@ -24319,6 +24535,22 @@ function MonthsAheadPanel({
       marginTop: '5px'
     }
   }, help));
+  const importNotice = importStatus && e("div", {
+    style: {
+      marginTop: '12px',
+      padding: '8px 12px',
+      borderRadius: '3px',
+      fontFamily: 'var(--mono)',
+      fontSize: '11px',
+      background: 'var(--panel-2)',
+      borderLeft: '2px solid ' + ({
+        good: 'var(--good)',
+        bad: 'var(--bad)',
+        info: 'var(--accent)'
+      }[importStatus.type] || 'var(--line)'),
+      color: importStatus.type === 'bad' ? 'var(--bad)' : 'var(--ink-dim)'
+    }
+  }, importStatus.message);
   const monthLabel = monthIso => {
     const parts = monthIso.split('-').map(Number);
     return new Date(parts[0], parts[1] - 1, 1).toLocaleDateString('en-AU', {
@@ -24368,21 +24600,37 @@ function MonthsAheadPanel({
     width: '76px',
     suffix: ' weeks',
     validate: v => Math.max(0, Math.min(104, v))
-  }), "After training, productivity ramps linearly from 50% to 100%.")), e("button", {
-    className: "btn ghost sm",
+  }), "After training, productivity ramps linearly from 50% to 100%.")), e("div", {
     style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: '8px',
       marginTop: '14px'
-    },
+    }
+  }, e("label", {
+    className: "btn sm",
+    title: "Import Month, Calls Offered and Shrinkage % from an Excel monthly results export"
+  }, "↑ Import monthly results", e("input", {
+    type: "file",
+    accept: ".xlsx,.xls,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    onChange: handleMonthlyImport,
+    style: {
+      display: 'none'
+    }
+  })), e("button", {
+    className: "btn ghost sm",
     onClick: () => updatePlan({
-      rows: makeMonthsAheadRows()
+      rows: makeMonthsAheadRows(),
+      seasonalityBaselineWeekly: null,
+      importSummary: null
     })
-  }, "Clear monthly changes")), e("div", {
+  }, "Clear monthly changes")), importNotice), e("div", {
     className: "months-ahead-note"
   }, e("strong", {
     style: {
       color: 'var(--ink)'
     }
-  }, "How the simulation works"), e("br"), "Hires start on the first day of their month. Attrition and proficient movements are also applied at month-start. Volume Δ is a permanent weekly call step-change from that month onward; seasonality is a separate multiplier for that month only. Monthly SL, ASA and abandonment are calculated at 15-minute level using the current weekly roster, volume shape, AHT, patience and Erlang model."))), e("div", {
+  }, "How the simulation works"), e("br"), "Hires start on the first day of their month. Attrition and proficient movements are also applied at month-start. Volume Δ is a permanent weekly call step-change from that month onward. Imported Calls Offered are converted to a day-count-adjusted seasonal run rate; editing calls recalculates that month’s seasonality. Monthly shrinkage scales productive floor capacity relative to the current roster baseline. All inputs remain editable."))), e("div", {
     className: "stat-strip",
     style: {
       marginTop: '16px',
@@ -24396,6 +24644,11 @@ function MonthsAheadPanel({
     label: "Baseline volume",
     value: Math.round(forecast.baselineWeeklyVolume).toLocaleString(),
     sub: 'offered calls per current week'
+  }), e(KPI, {
+    label: "Baseline shrinkage",
+    value: forecast.baselineShrinkagePct.toFixed(1),
+    unit: "%",
+    sub: 'derived from the current roster and downtime'
   }), e(KPI, {
     label: "Month 12 people",
     value: last.staffHeadcount,
@@ -24412,7 +24665,7 @@ function MonthsAheadPanel({
     className: "panel-h"
   }, e("h2", null, "Service trajectory"), e("span", {
     className: "h-meta"
-  }, "SLA · mean stable-interval ASA")), e("div", {
+  }, "SLA · backlog-aware ASA")), e("div", {
     className: "panel-b",
     style: {
       overflowX: 'auto'
@@ -24435,17 +24688,23 @@ function MonthsAheadPanel({
     className: "panel-h"
   }, e("h2", null, "Monthly plan and forecast"), e("span", {
     className: "h-meta"
-  }, "Positive / negative demand and staffing scenarios update instantly")), e("div", {
+  }, "Imported values and manual adjustments update instantly")), e("div", {
     className: "months-ahead-table-wrap"
   }, e("table", {
     className: "data months-ahead"
-  }, e("thead", null, e("tr", null, th("Month"), th("Hires", "new starters"), th("Attrition", "proficient out"), th("Manual in", "proficient in"), th("Manual out", "proficient out"), th("Volume Δ", "calls/week · lasting", "Signed change to weekly offered calls, carried into every following month"), th("Seasonality", "this month only"), th("People", "month-end HC"), th("Floor FTE", "avg productive"), th("Volume", "calls/week"), th("SLA", "within target"), th("ASA", "mean"), th("Abandonment", "% · calls/month"))), e("tbody", null, months.map((month, index) => {
+  }, e("thead", null, e("tr", null, th("Month"), th("Hires", "new starters"), th("Attrition", "proficient out"), th("Manual in", "proficient in"), th("Manual out", "proficient out"), th("Volume Δ", "calls/week · lasting", "Signed change to weekly offered calls, carried into every following month"), th("Calls pattern", "calls/month", "Imported historical Calls Offered. Editing this recalculates seasonality against the imported average weekly run rate."), th("Seasonality", "this month only"), th("Shrinkage", "monthly expectation", "Overall shrinkage expectation for the month. Blank uses the current roster baseline."), th("People", "month-end HC"), th("Floor FTE", "avg productive"), th("Volume", "calls/week"), th("SLA", "within target"), th("ASA", "mean"), th("Abandonment", "% · calls/month"))), e("tbody", null, months.map((month, index) => {
     const row = plan.rows[index];
     return e("tr", {
       key: month.monthIso
     }, e("td", {
       className: "month-name"
-    }, monthLabel(month.monthIso)), e("td", null, integerEditor(row.hires, value => updateRow(index, {
+    }, monthLabel(month.monthIso), row.sourceMonth && e("div", {
+      style: {
+        color: 'var(--ink-faint)',
+        fontSize: '8px',
+        marginTop: '2px'
+      }
+    }, "source ", monthLabel(row.sourceMonth))), e("td", null, integerEditor(row.hires, value => updateRow(index, {
       hires: value
     }), '54px', 'Hires starting at the beginning of this month')), e("td", null, integerEditor(row.attrition, value => updateRow(index, {
       attrition: value
@@ -24460,6 +24719,14 @@ function MonthsAheadPanel({
       step: 100,
       validate: v => Math.round(v),
       title: 'Signed weekly call change from this month onward, e.g. 500 or -300'
+    })), e("td", null, decimalEditor(row.callsOffered, value => updateCallsOffered(index, value), {
+      width: '82px',
+      min: 0,
+      step: 100,
+      allowClear: true,
+      format: value => value === null || value === undefined ? '' : String(Math.round(value)),
+      validate: value => Math.max(0, Math.round(value)),
+      title: 'Historical monthly Calls Offered. Changing this automatically recalculates seasonality; clear to keep only the manual seasonal factor.'
     })), e("td", null, decimalEditor(row.seasonalityPct, value => updateRow(index, {
       seasonalityPct: value
     }), {
@@ -24470,9 +24737,27 @@ function MonthsAheadPanel({
       suffix: '%',
       validate: v => Math.max(0, Math.min(500, v)),
       title: 'Month-only demand multiplier; 100% means no seasonal change'
+    })), e("td", null, decimalEditor(row.shrinkagePct, value => updateRow(index, {
+      shrinkagePct: value
+    }), {
+      width: '62px',
+      min: 0,
+      max: 99,
+      step: 0.5,
+      suffix: '%',
+      allowClear: true,
+      format: value => value === null || value === undefined ? '' : (+value).toFixed(1),
+      validate: value => Math.max(0, Math.min(99, value)),
+      title: 'Expected total monthly shrinkage. Clear to use the current roster baseline of ' + forecast.baselineShrinkagePct.toFixed(1) + '%.'
     })), e("td", null, month.staffHeadcount), e("td", {
       title: month.hireFloorFTE.toFixed(2) + ' effective FTE from hire cohorts'
-    }, month.floorFTE.toFixed(1)), e("td", null, Math.round(month.weeklyVolume).toLocaleString()), e("td", {
+    }, month.floorFTE.toFixed(1), e("div", {
+      style: {
+        color: 'var(--ink-faint)',
+        fontSize: '8px',
+        marginTop: '2px'
+      }
+    }, month.shrinkagePct.toFixed(1), "% shrink")), e("td", null, Math.round(month.weeklyVolume).toLocaleString()), e("td", {
       style: {
         color: slTone(month) === 'good' ? 'var(--good)' : slTone(month) === 'warn' ? 'var(--warn)' : 'var(--bad)',
         fontWeight: 600
