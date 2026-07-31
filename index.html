@@ -719,6 +719,26 @@ const LAST_SEEN_VERSION_KEY = 'wfm-last-seen-version';
 // `tag` is one of 'feat' (new feature), 'fix' (bug fix), 'change' (behaviour change),
 // 'ui' (visual/interaction tweak). Plain strings default to 'feat'.
 const CHANGELOG = [{
+  version: '0.44.0',
+  date: '2026-07-31',
+  title: 'Actual-calibrated abandonment forecasting',
+  changes: [{
+    tag: 'fix',
+    text: 'The Erlang C abandonment overlay now carries a separate Erlang A queue that removes callers as they abandon. Predicted hang-ups no longer remain in the infinite-patience backlog and inflate every later interval.'
+  }, {
+    tag: 'feat',
+    text: 'Monthly results import now reads Abandon %, Avg. Abandon Time, and under-30-second abandon counts alongside calls and shrinkage. Avg. Abandon Time seeds an editable per-month caller-patience assumption.'
+  }, {
+    tag: 'feat',
+    text: 'Months Ahead now shows editable actual abandonment and patience columns, plus forecast variance in percentage points against the imported actual.'
+  }, {
+    tag: 'change',
+    text: 'Short abandons remain visible as separate source context and are not silently added to or removed from the export’s reported abandonment rate.'
+  }, {
+    tag: 'change',
+    text: 'Regression coverage reconciles the Erlang C overlay against the integrated Erlang A queue and verifies abandonment, duration, patience, and short-abandon imports.'
+  }]
+}, {
   version: '0.43.1',
   date: '2026-07-31',
   title: 'Months Ahead controls restored',
@@ -5689,8 +5709,14 @@ function applyQueueCarryoverToDay(row, config, startIdx, endIdx) {
   const stepSec = intervalSec / substeps;
   const isA = config.model === 'A';
   const patience = config.patienceSec > 0 ? config.patienceSec : 0;
-  const abandonRate = isA && patience > 0 ? 1 / patience : 0;
+  const primaryAbandonRate = isA && patience > 0 ? 1 / patience : 0;
+  const overlayAbandonRate = patience > 0 ? 1 / patience : 0;
   let queue = 0;
+  // Erlang C needs two queues: its primary infinite-patience queue drives SLA/ASA,
+  // while a separate Erlang A overlay queue removes callers as they abandon. Reusing
+  // the C queue for abandonment left predicted hang-ups in backlog and materially
+  // overstated abandonment in every later interval.
+  let abandonQueue = 0;
   for (let i = startIdx; i < endIdx; i++) {
     const r = row[i];
     if (!r) continue;
@@ -5698,13 +5724,15 @@ function applyQueueCarryoverToDay(row, config, startIdx, endIdx) {
     const arrivalRate = calls / intervalSec;
     const serviceRate = r.effectiveAgents > 0 && config.ahtSec > 0 ? r.effectiveAgents / config.ahtSec : 0;
     const backlogStart = queue;
+    const abandonBacklogStart = isA ? queue : abandonQueue;
     let asaNumerator = 0;
     let asaWeight = 0;
     let slNumerator = 0;
     let abandoned = 0;
     for (let step = 0; step < substeps; step++) {
       const stepCalls = calls / substeps;
-      const qMid = advanceFluidQueue(queue, arrivalRate, serviceRate, abandonRate, stepSec / 2);
+      const qMid = advanceFluidQueue(queue, arrivalRate, serviceRate, primaryAbandonRate, stepSec / 2);
+      const abandonQMid = isA ? qMid : advanceFluidQueue(abandonQueue, arrivalRate, serviceRate, overlayAbandonRate, stepSec / 2);
       let stepASA = r.asa;
       let stepSL = r.sl;
       let stepAbandon = r.pAbandon || 0;
@@ -5719,8 +5747,10 @@ function applyQueueCarryoverToDay(row, config, startIdx, endIdx) {
         } else {
           const queueSL = isFinite(queueASA) && queueASA > 0 ? 1 - Math.exp(-config.slTargetSec / queueASA) : 0;
           stepSL = Math.min(stepSL, queueSL);
-          if (patience > 0) stepAbandon = Math.max(stepAbandon, 1 - queueAnswerProbability(qMid, serviceRate, patience));
         }
+      }
+      if (!isA && patience > 0 && abandonQMid > 1e-9) {
+        stepAbandon = Math.max(stepAbandon, 1 - queueAnswerProbability(abandonQMid, serviceRate, patience));
       }
       const answeredWeight = isA ? stepCalls * Math.max(0, 1 - stepAbandon) : stepCalls;
       if (isFinite(stepASA) && answeredWeight > 0) {
@@ -5729,7 +5759,8 @@ function applyQueueCarryoverToDay(row, config, startIdx, endIdx) {
       }
       slNumerator += stepSL * stepCalls;
       abandoned += stepAbandon * stepCalls;
-      queue = advanceFluidQueue(queue, arrivalRate, serviceRate, abandonRate, stepSec);
+      queue = advanceFluidQueue(queue, arrivalRate, serviceRate, primaryAbandonRate, stepSec);
+      abandonQueue = isA ? queue : advanceFluidQueue(abandonQueue, arrivalRate, serviceRate, overlayAbandonRate, stepSec);
     }
     if (calls > 0 && !(serviceRate > 0) && patience > 0) abandoned = calls;
     const overloaded = calls > 0 && r.traffic >= r.effectiveAgents;
@@ -5744,6 +5775,8 @@ function applyQueueCarryoverToDay(row, config, startIdx, endIdx) {
       stationaryAsa: r.asa,
       backlogStart,
       backlogEnd: queue,
+      abandonBacklogStart,
+      abandonBacklogEnd: isA ? queue : abandonQueue,
       overloaded,
       unstable: calls > 0 && !isFinite(transientASA)
     });
@@ -5860,6 +5893,10 @@ function makeMonthsAheadRows() {
     seasonalityPct: 100,
     callsOffered: null,
     shrinkagePct: null,
+    actualAbandonPct: null,
+    avgAbandonTimeSec: null,
+    patienceSec: null,
+    shortAbandonCalls: null,
     sourceMonth: null
   }));
 }
@@ -5885,6 +5922,10 @@ function normaliseMonthsAhead(value) {
       seasonalityPct: isFinite(+incoming.seasonalityPct) ? Math.max(0, +incoming.seasonalityPct) : 100,
       callsOffered: incoming.callsOffered !== null && incoming.callsOffered !== undefined && isFinite(+incoming.callsOffered) ? Math.max(0, +incoming.callsOffered) : null,
       shrinkagePct: incoming.shrinkagePct !== null && incoming.shrinkagePct !== undefined && isFinite(+incoming.shrinkagePct) ? Math.max(0, Math.min(100, +incoming.shrinkagePct)) : null,
+      actualAbandonPct: incoming.actualAbandonPct !== null && incoming.actualAbandonPct !== undefined && isFinite(+incoming.actualAbandonPct) ? Math.max(0, Math.min(100, +incoming.actualAbandonPct)) : null,
+      avgAbandonTimeSec: incoming.avgAbandonTimeSec !== null && incoming.avgAbandonTimeSec !== undefined && isFinite(+incoming.avgAbandonTimeSec) ? Math.max(1, Math.min(21600, +incoming.avgAbandonTimeSec)) : null,
+      patienceSec: incoming.patienceSec !== null && incoming.patienceSec !== undefined && isFinite(+incoming.patienceSec) ? Math.max(1, Math.min(21600, +incoming.patienceSec)) : null,
+      shortAbandonCalls: incoming.shortAbandonCalls !== null && incoming.shortAbandonCalls !== undefined && isFinite(+incoming.shortAbandonCalls) ? Math.max(0, Math.round(+incoming.shortAbandonCalls)) : null,
       sourceMonth: /^\d{4}-\d{2}$/.test(incoming.sourceMonth || '') ? incoming.sourceMonth : null
     });
   });
@@ -5940,6 +5981,30 @@ function parseMonthlyPercent(raw) {
   const value = +raw;
   return Math.max(0, Math.min(100, Math.abs(value) <= 1.5 ? value * 100 : value));
 }
+function parseMonthlySeconds(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (raw instanceof Date && !isNaN(raw.getTime())) {
+    const seconds = raw.getHours() * 3600 + raw.getMinutes() * 60 + raw.getSeconds();
+    return seconds > 0 ? Math.min(21600, seconds) : null;
+  }
+  if (typeof raw === 'number' && isFinite(raw)) {
+    const seconds = raw > 0 && raw <= 1 ? raw * 86400 : raw;
+    return seconds > 0 ? Math.min(21600, seconds) : null;
+  }
+  const text = String(raw).trim();
+  let match = /^(\d{1,2}):(\d{2}):(\d{2})(?:\.\d+)?$/.exec(text);
+  if (match) return Math.min(21600, +match[1] * 3600 + +match[2] * 60 + +match[3]);
+  match = /^(\d{1,3}):(\d{2})(?:\.\d+)?$/.exec(text);
+  if (match) return Math.min(21600, +match[1] * 60 + +match[2]);
+  match = /^(\d+(?:\.\d+)?)\s*(s|sec|secs|seconds?|m|min|mins|minutes?)$/i.exec(text);
+  if (match) {
+    const seconds = +match[1] * (/^m/i.test(match[2]) ? 60 : 1);
+    return seconds > 0 ? Math.min(21600, seconds) : null;
+  }
+  const numeric = +text;
+  if (!isFinite(numeric) || numeric <= 0) return null;
+  return Math.min(21600, numeric <= 1 ? numeric * 86400 : numeric);
+}
 function parseMonthsAheadXLSX(XLSX, arrayBuffer) {
   const wb = XLSX.read(arrayBuffer, {
     type: 'array',
@@ -5962,6 +6027,9 @@ function parseMonthsAheadXLSX(XLSX, arrayBuffer) {
   const monthKey = firstKey(sample, ['Month', 'Calendar Month', 'Reporting Month', 'Date']);
   const callsKey = firstKey(sample, ['Calls Offered', 'Offered Calls', 'CallsOffered', 'Offered', 'Volume']);
   const shrinkageKey = firstKey(sample, ['Shrinkage %', 'Shrinkage', 'Total Shrinkage %', 'Total Shrinkage']);
+  const abandonKey = firstKey(sample, ['Abandon % (NW)', 'Abandon %', 'Abandonment %', 'Abandon Rate', 'Abandonment Rate']);
+  const avgAbandonTimeKey = firstKey(sample, ['Avg. Abandon Time', 'Average Abandon Time', 'Avg Abandon Time', 'Average Patience', 'Patience']);
+  const shortAbandonKey = firstKey(sample, ['ABN Calls (-30 secs)', 'ABN Calls (<30 secs)', 'Short Abandons', 'Short Abandon Calls']);
   const componentKeys = [
     firstKey(sample, ['Shrinkage % (Div)', 'hrinkage % (Div)', 'Shrinkage Div']),
     firstKey(sample, ['Shrinkage % (Downtime)', 'hrinkage % (Downtime)', 'Shrinkage Downtime']),
@@ -5981,11 +6049,18 @@ function parseMonthsAheadXLSX(XLSX, arrayBuffer) {
       const components = componentKeys.map(key => parseMonthlyPercent(row[key])).filter(value => value !== null);
       if (components.length) shrinkagePct = Math.min(100, components.reduce((sum, value) => sum + value, 0));
     }
-    if (calls === null && shrinkagePct === null) continue;
+    const actualAbandonPct = abandonKey ? parseMonthlyPercent(row[abandonKey]) : null;
+    const avgAbandonTimeSec = avgAbandonTimeKey ? parseMonthlySeconds(row[avgAbandonTimeKey]) : null;
+    const shortAbandonCalls = shortAbandonKey && row[shortAbandonKey] !== null && row[shortAbandonKey] !== undefined && row[shortAbandonKey] !== '' && isFinite(+row[shortAbandonKey]) ? Math.max(0, Math.round(+row[shortAbandonKey])) : null;
+    if (calls === null && shrinkagePct === null && actualAbandonPct === null && avgAbandonTimeSec === null) continue;
     out.push({
       monthIso,
       callsOffered: calls,
-      shrinkagePct
+      shrinkagePct,
+      actualAbandonPct,
+      avgAbandonTimeSec,
+      patienceSec: avgAbandonTimeSec,
+      shortAbandonCalls
     });
   }
   if (!out.length) {
@@ -6010,6 +6085,10 @@ function applyMonthlyResultsToPlan(value, importedRows) {
   const clearedRows = plan.rows.map(row => row.sourceMonth ? Object.assign({}, row, {
     callsOffered: null,
     shrinkagePct: null,
+    actualAbandonPct: null,
+    avgAbandonTimeSec: null,
+    patienceSec: null,
+    shortAbandonCalls: null,
     sourceMonth: null,
     seasonalityPct: 100
   }) : row);
@@ -6020,6 +6099,10 @@ function applyMonthlyResultsToPlan(value, importedRows) {
     return Object.assign({}, row, {
       callsOffered: source.callsOffered,
       shrinkagePct: source.shrinkagePct,
+      actualAbandonPct: source.actualAbandonPct,
+      avgAbandonTimeSec: source.avgAbandonTimeSec,
+      patienceSec: source.patienceSec,
+      shortAbandonCalls: source.shortAbandonCalls,
       sourceMonth: source.monthIso,
       seasonalityPct: source.callsOffered !== null && baselineWeekly > 0 ? monthlySeasonalityFromCalls(source.callsOffered, source.monthIso, baselineWeekly) : row.seasonalityPct
     });
@@ -6030,7 +6113,9 @@ function applyMonthlyResultsToPlan(value, importedRows) {
     importSummary: {
       rows: importedRows.length,
       firstMonth: importedRows[0].monthIso,
-      lastMonth: importedRows[importedRows.length - 1].monthIso
+      lastMonth: importedRows[importedRows.length - 1].monthIso,
+      abandonmentRows: importedRows.filter(row => row.actualAbandonPct !== null).length,
+      patienceRows: importedRows.filter(row => row.patienceSec !== null).length
     }
   });
 }
@@ -6209,8 +6294,12 @@ function computeMonthsAheadForecast(state, grid, baselineAvailability) {
     const preSeasonWeeklyVolume = Math.max(0, baselineWeeklyVolume + cumulativeVolumeDelta);
     const weeklyVolume = preSeasonWeeklyVolume * seasonality;
     const monthVolume = scaleForecastVolume(state.volume, state.config, weeklyVolume);
-    const sla = computeSLA(monthVolume, monthAvailability, state.config);
-    const metrics = summariseForecastSLA(sla, state.config);
+    const monthPatienceSec = row.patienceSec === null || row.patienceSec === undefined ? state.config.patienceSec : row.patienceSec;
+    const monthConfig = Object.assign({}, state.config, {
+      patienceSec: monthPatienceSec
+    });
+    const sla = computeSLA(monthVolume, monthAvailability, monthConfig);
+    const metrics = summariseForecastSLA(sla, monthConfig);
     const monthIso = monthIsoAt(plan.startMonth, monthIndex);
     const calendarFactor = daysInMonthIso(monthIso) / 7;
     out.push(Object.assign({}, metrics, {
@@ -6223,6 +6312,11 @@ function computeMonthsAheadForecast(state, grid, baselineAvailability) {
       weeklyVolume,
       monthlyCalls: metrics.calls * calendarFactor,
       monthlyAbandoned: metrics.abandoned * calendarFactor,
+      actualAbandonPct: row.actualAbandonPct,
+      abandonVariancePp: row.actualAbandonPct === null || row.actualAbandonPct === undefined ? null : metrics.abandonPct * 100 - row.actualAbandonPct,
+      patienceSec: monthPatienceSec,
+      avgAbandonTimeSec: row.avgAbandonTimeSec,
+      shortAbandonCalls: row.shortAbandonCalls,
       seasonalityPct: row.seasonalityPct,
       shrinkagePct: targetShrinkageFrac * 100,
       cumulativeVolumeDelta
@@ -9902,7 +9996,7 @@ function ConfigPanel({
     style: {
       color: 'var(--warn)'
     }
-  }, "Model scope: "), "Each 15-minute interval is evaluated as a steady-state queue. Calls waiting at the interval boundary are not carried into the next interval, so sharp spikes or outages may recover faster here than in a transient/discrete-event simulation."), sectionHeading('Service Targets', 'Defines what counts as a breach and feeds the queue math'), /*#__PURE__*/React.createElement("div", {
+  }, "Model scope: "), "Each 15-minute interval begins with the stationary Erlang result, then a sequential fluid pass carries backlog into later intervals. Erlang C keeps an infinite-patience queue for SLA and ASA; its abandonment overlay carries a separate Erlang A queue that removes hang-ups."), sectionHeading('Service Targets', 'Defines what counts as a breach and feeds the queue math'), /*#__PURE__*/React.createElement("div", {
     className: "grid-4"
   }, /*#__PURE__*/React.createElement("label", {
     className: "field"
@@ -24366,7 +24460,7 @@ function SummaryStrip({
       fontSize: '9px',
       marginTop: '2px'
     }
-  }, isA ? state.config.patienceSec + 's patience' : 'no abandons')), metric === 'asa' ? /*#__PURE__*/React.createElement(Fragment, null, /*#__PURE__*/React.createElement(KPI, {
+  }, isA ? state.config.patienceSec + 's patience' : 'A overlay · ' + state.config.patienceSec + 's')), metric === 'asa' ? /*#__PURE__*/React.createElement(Fragment, null, /*#__PURE__*/React.createElement(KPI, {
     label: "Weekly ASA",
     value: asaDisplay,
     unit: "",
@@ -24488,7 +24582,7 @@ function MonthsAheadPanel({
       }));
       setImportStatus({
         type: 'good',
-        message: 'Imported ' + imported.length + ' monthly result' + (imported.length === 1 ? '' : 's') + ' from ' + imported[0].monthIso + ' to ' + imported[imported.length - 1].monthIso + '. Calls, seasonality and shrinkage remain editable below.'
+        message: 'Imported ' + imported.length + ' monthly result' + (imported.length === 1 ? '' : 's') + ' from ' + imported[0].monthIso + ' to ' + imported[imported.length - 1].monthIso + '. Calls, seasonality, shrinkage, actual abandonment and caller patience remain editable below.'
       });
     } catch (err) {
       setImportStatus({
@@ -24620,7 +24714,7 @@ function MonthsAheadPanel({
     }
   }, e("label", {
     className: "btn sm",
-    title: "Import Month, Calls Offered and Shrinkage % from an Excel monthly results export"
+    title: "Import Month, Calls Offered, Shrinkage %, Abandon %, Avg. Abandon Time and short-abandon counts from an Excel monthly results export"
   }, "↑ Import monthly results", e("input", {
     type: "file",
     accept: ".xlsx,.xls,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -24641,7 +24735,7 @@ function MonthsAheadPanel({
     style: {
       color: 'var(--ink)'
     }
-  }, "How the simulation works"), e("br"), "Hires start on the first day of their month. Attrition and proficient movements are also applied at month-start. Volume Δ is a permanent weekly call step-change from that month onward. Imported Calls Offered are converted to a day-count-adjusted seasonal run rate; editing calls recalculates that month’s seasonality. Monthly shrinkage scales productive floor capacity relative to the current roster baseline. All inputs remain editable."))), e("div", {
+  }, "How the simulation works"), e("br"), "Hires start on the first day of their month. Attrition and proficient movements are also applied at month-start. Volume Δ is a permanent weekly call step-change from that month onward. Imported Calls Offered are converted to a day-count-adjusted seasonal run rate; editing calls recalculates that month’s seasonality. Monthly shrinkage scales productive floor capacity relative to the current roster baseline. Imported actual abandonment is shown as a benchmark, while Avg. Abandon Time becomes that month’s editable caller-patience assumption. Short abandons remain visible as source context and are not silently added to or removed from the reported rate."))), e("div", {
     className: "stat-strip",
     style: {
       marginTop: '16px',
@@ -24703,7 +24797,7 @@ function MonthsAheadPanel({
     className: "months-ahead-table-wrap"
   }, e("table", {
     className: "data months-ahead"
-  }, e("thead", null, e("tr", null, th("Month"), th("Hires", "new starters"), th("Attrition", "proficient out"), th("Manual in", "proficient in"), th("Manual out", "proficient out"), th("Volume Δ", "calls/week · lasting", "Signed change to weekly offered calls, carried into every following month"), th("Calls pattern", "calls/month", "Imported historical Calls Offered. Editing this recalculates seasonality against the imported average weekly run rate."), th("Seasonality", "this month only"), th("Shrinkage", "monthly expectation", "Overall shrinkage expectation for the month. Blank uses the current roster baseline."), th("People", "month-end HC"), th("Floor FTE", "avg productive"), th("Volume", "calls/week"), th("SLA", "within target"), th("ASA", "mean"), th("Abandonment", "% · calls/month"))), e("tbody", null, months.map((month, index) => {
+  }, e("thead", null, e("tr", null, th("Month"), th("Hires", "new starters"), th("Attrition", "proficient out"), th("Manual in", "proficient in"), th("Manual out", "proficient out"), th("Volume Δ", "calls/week · lasting", "Signed change to weekly offered calls, carried into every following month"), th("Calls pattern", "calls/month", "Imported historical Calls Offered. Editing this recalculates seasonality against the imported average weekly run rate."), th("Seasonality", "this month only"), th("Shrinkage", "monthly expectation", "Overall shrinkage expectation for the month. Blank uses the current roster baseline."), th("Actual abandon", "reported benchmark", "Imported Abandon % exactly as reported by the monthly export. Short-abandon counts are shown separately rather than changing this rate."), th("Patience", "seconds", "Caller-patience assumption used for Erlang A and the Erlang C abandonment overlay. Imported Avg. Abandon Time is used initially; clear to use the Config default."), th("People", "month-end HC"), th("Floor FTE", "avg productive"), th("Volume", "calls/week"), th("SLA", "within target"), th("ASA", "mean"), th("Abandonment", "forecast % · calls/month"))), e("tbody", null, months.map((month, index) => {
     const row = plan.rows[index];
     return e("tr", {
       key: month.monthIso
@@ -24760,7 +24854,45 @@ function MonthsAheadPanel({
       format: value => value === null || value === undefined ? '' : (+value).toFixed(1),
       validate: value => Math.max(0, Math.min(99, value)),
       title: 'Expected total monthly shrinkage. Clear to use the current roster baseline of ' + forecast.baselineShrinkagePct.toFixed(1) + '%.'
-    })), e("td", null, month.staffHeadcount), e("td", {
+    })), e("td", {
+      title: row.shortAbandonCalls === null ? 'Historical abandonment percentage reported by the source export' : row.shortAbandonCalls.toLocaleString() + ' short abandons under 30 seconds were reported separately in the source export'
+    }, decimalEditor(row.actualAbandonPct, value => updateRow(index, {
+      actualAbandonPct: value
+    }), {
+      width: '62px',
+      min: 0,
+      max: 100,
+      step: 0.5,
+      suffix: '%',
+      allowClear: true,
+      format: value => value === null || value === undefined ? '' : (+value).toFixed(1),
+      validate: value => Math.max(0, Math.min(100, value)),
+      title: 'Historical Abandon % reported by the export; this is a benchmark, not silently substituted for the forecast'
+    }), row.shortAbandonCalls !== null && e("div", {
+      style: {
+        color: 'var(--ink-faint)',
+        fontSize: '8px',
+        marginTop: '2px'
+      }
+    }, row.shortAbandonCalls.toLocaleString(), " <30s")), e("td", null, decimalEditor(row.patienceSec, value => updateRow(index, {
+      patienceSec: value
+    }), {
+      width: '62px',
+      min: 1,
+      max: 21600,
+      step: 15,
+      suffix: 's',
+      allowClear: true,
+      format: value => value === null || value === undefined ? '' : String(Math.round(value)),
+      validate: value => Math.max(1, Math.min(21600, Math.round(value))),
+      title: 'Average caller patience used by the abandonment model. Clear to use the Config default of ' + state.config.patienceSec + ' seconds.'
+    }), row.avgAbandonTimeSec !== null && e("div", {
+      style: {
+        color: 'var(--ink-faint)',
+        fontSize: '8px',
+        marginTop: '2px'
+      }
+    }, "source ", formatSeconds(row.avgAbandonTimeSec))), e("td", null, month.staffHeadcount), e("td", {
       title: month.hireFloorFTE.toFixed(2) + ' effective FTE from hire cohorts'
     }, month.floorFTE.toFixed(1), e("div", {
       style: {
@@ -24781,7 +24913,13 @@ function MonthsAheadPanel({
       }
     }, month.unstableIntervals, " overloaded int.")), e("td", {
       title: Math.round(month.monthlyAbandoned).toLocaleString() + ' forecast abandoned calls in this calendar month'
-    }, (month.abandonPct * 100).toFixed(1), "% · ", Math.round(month.monthlyAbandoned).toLocaleString()));
+    }, (month.abandonPct * 100).toFixed(1), "% · ", Math.round(month.monthlyAbandoned).toLocaleString(), month.abandonVariancePp !== null && e("div", {
+      style: {
+        color: Math.abs(month.abandonVariancePp) <= 3 ? 'var(--good)' : Math.abs(month.abandonVariancePp) <= 7 ? 'var(--warn)' : 'var(--bad)',
+        fontSize: '8px',
+        marginTop: '2px'
+      }
+    }, (month.abandonVariancePp >= 0 ? '+' : ''), month.abandonVariancePp.toFixed(1), "pp vs actual")));
   }))))));
 }
 

@@ -64,6 +64,7 @@ const monthRows = makeMonthsAheadRows();
 assert.equal(monthRows.length, 12);
 assert.ok(monthRows.every(row => row.seasonalityPct === 100), 'seasonality must default to a neutral 100%');
 assert.ok(monthRows.every(row => row.shrinkagePct === null && row.callsOffered === null), 'monthly imports must start as optional blank assumptions');
+assert.ok(monthRows.every(row => row.actualAbandonPct === null && row.patienceSec === null), 'abandonment benchmarks and monthly patience must default blank');
 assert.equal(nextCalendarMonthIso(new Date(2026, 6, 30, 12)), '2026-08', 'default month must use the local calendar rather than UTC month boundaries');
 const firstMonthRamp = averageCohortProductivity(0, 0, '2026-08', 4, 8);
 assert.ok(firstMonthRamp > 0 && firstMonthRamp < 0.1, 'a four-week training period should leave only a small end-of-month floor contribution');
@@ -107,11 +108,17 @@ const fakeMonthlyXLSX = {
     sheet_to_json: () => [{
       Month: 'July 2025',
       'Calls Offered': 31000,
-      'Shrinkage %': 0.32
+      'Shrinkage %': 0.32,
+      'Abandon % (NW)': 0.23,
+      'Avg. Abandon Time': 300 / 86400,
+      'ABN Calls (-30 secs)': 120
     }, {
       Month: 'August 2025',
       'Calls Offered': 37200,
-      'Shrinkage %': 35
+      'Shrinkage %': 35,
+      'Abandon % (NW)': 25,
+      'Avg. Abandon Time': '04:00',
+      'ABN Calls (-30 secs)': 140
     }]
   },
   SSF: { parse_date_code: () => null }
@@ -119,6 +126,11 @@ const fakeMonthlyXLSX = {
 const parsedMonthly = parseMonthsAheadXLSX(fakeMonthlyXLSX, new ArrayBuffer(0));
 assert.deepEqual(Array.from(parsedMonthly, row => row.monthIso), ['2025-07', '2025-08']);
 assert.equal(parsedMonthly[0].shrinkagePct, 32, 'decimal shrinkage percentages must import as percentage points');
+assert.equal(parsedMonthly[0].actualAbandonPct, 23, 'decimal abandonment percentages must import as percentage points');
+assert.ok(Math.abs(parsedMonthly[0].avgAbandonTimeSec - 300) < 0.01, 'Excel time fractions must import as seconds');
+assert.equal(parsedMonthly[0].patienceSec, parsedMonthly[0].avgAbandonTimeSec, 'imported average abandon time must seed caller patience');
+assert.equal(parsedMonthly[1].avgAbandonTimeSec, 240, 'mm:ss abandonment times must import as seconds');
+assert.equal(parsedMonthly[1].shortAbandonCalls, 140, 'short abandons must remain visible as separate source context');
 const componentMonthlyXLSX = {
   read: fakeMonthlyXLSX.read,
   utils: {
@@ -142,6 +154,9 @@ const importedPlan = applyMonthlyResultsToPlan({
 }, parsedMonthly);
 assert.equal(importedPlan.rows[0].callsOffered, 37200, 'historical August calls must map to the forecast August row');
 assert.equal(importedPlan.rows[0].shrinkagePct, 35, 'monthly shrinkage must map by calendar month');
+assert.equal(importedPlan.rows[0].actualAbandonPct, 25, 'historical abandonment must map by calendar month');
+assert.equal(importedPlan.rows[0].patienceSec, 240, 'historical average abandon time must seed the matching month patience');
+assert.equal(importedPlan.rows[0].shortAbandonCalls, 140, 'short-abandon context must map without changing the reported abandonment rate');
 assert.ok(importedPlan.rows[0].seasonalityPct > 100, 'above-average weekly call run-rate must produce a seasonal uplift');
 assert.equal(importedPlan.rows[11].sourceMonth, '2025-07', 'calendar seasonality must repeat into the matching future month');
 
@@ -159,6 +174,13 @@ shrinkageState.monthsAhead.rows[0].shrinkagePct = 50;
 const highShrinkageMonth = computeMonthsAheadForecast(shrinkageState, shrinkageSchedule.grid, shrinkageAvailability).months[0];
 assert.ok(highShrinkageMonth.floorFTE < baselineMonth.floorFTE, 'higher monthly shrinkage must reduce productive floor capacity');
 assert.ok(highShrinkageMonth.sl <= baselineMonth.sl, 'higher monthly shrinkage must not improve SLA');
+shrinkageState.monthsAhead.rows[0].patienceSec = 600;
+shrinkageState.monthsAhead.rows[0].actualAbandonPct = 23;
+const calibratedPatienceMonth = computeMonthsAheadForecast(shrinkageState, shrinkageSchedule.grid, shrinkageAvailability).months[0];
+assert.equal(calibratedPatienceMonth.patienceSec, 600, 'monthly patience must override the Config default');
+assert.equal(calibratedPatienceMonth.actualAbandonPct, 23, 'actual abandonment must remain available as a comparison benchmark');
+assert.ok(calibratedPatienceMonth.abandonPct <= highShrinkageMonth.abandonPct, 'longer caller patience must not increase forecast abandonment');
+assert.ok(Math.abs(calibratedPatienceMonth.abandonVariancePp - (calibratedPatienceMonth.abandonPct * 100 - 23)) < 1e-9, 'forecast variance must reconcile to the imported actual');
 const noStaffState = cloneDefault();
 noStaffState.monthsAhead = {
   startMonth: '2026-08',
@@ -192,6 +214,8 @@ assert.match(monthsAheadText, /12-month scenario settings/);
 assert.match(monthsAheadText, /Import monthly results/);
 assert.match(monthsAheadText, /Service trajectory/);
 assert.match(monthsAheadText, /Monthly plan and forecast/);
+assert.match(monthsAheadText, /Actual abandon/);
+assert.match(monthsAheadText, /Patience/);
 
 const averageGrids = get('averageGrids');
 const mkGrid = code => Array.from({ length: 7 }, () => [new Array(96).fill(code)]);
@@ -370,6 +394,12 @@ assert.ok(backlogDay.asa > 1000 && backlogDay.asa < 1400, 'backlog carryover mus
 assert.equal(backlogDay.unstableIntervals, 1, 'the overloaded spike must remain visible as a diagnostic interval');
 assert.ok(backlogSla[0][29].backlogStart > 50, 'the next interval must inherit the spike queue');
 assert.ok(Number.isFinite(backlogSla[0][28].asa), 'a transient overload with active agents must have a finite virtual wait');
+const queueConfigA = Object.assign({}, queueConfig, { model: 'A' });
+const backlogSlaA = computeSLA(queueVolume, queueAvailability, queueConfigA);
+const cOverlayAbandoned = backlogSla[0].reduce((sum, row) => sum + (row.abandoned || 0), 0);
+const aIntegratedAbandoned = backlogSlaA[0].reduce((sum, row) => sum + (row.abandoned || 0), 0);
+assert.ok(Math.abs(cOverlayAbandoned - aIntegratedAbandoned) < 1e-6, 'Erlang C abandonment overlay must drain its own queue exactly like the integrated Erlang A queue');
+assert.ok(backlogSla[0][29].abandonBacklogStart < backlogSla[0][29].backlogStart, 'abandoned callers must not remain in the C overlay backlog');
 const sustainedVolume = queueVolume.map(row => row.slice());
 for (let i = 28; i < 37; i++) sustainedVolume[0][i] = 90;
 const sustainedDay = computeDailyMetrics(computeSLA(sustainedVolume, queueAvailability, queueConfig), queueConfig)[0];
