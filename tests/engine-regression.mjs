@@ -173,6 +173,26 @@ const noStaffForecast = computeMonthsAheadForecast(noStaffState, noStaffSchedule
 assert.equal(noStaffForecast.months[0].staffHeadcount, 0);
 assert.equal(noStaffForecast.months[0].abandonPct, 1, 'Erlang C abandonment overlay must forecast all offered calls abandoning when no staff remain');
 
+// The Months Ahead view must render all three sibling panels. A misplaced
+// parenthesis previously turned this into a comma expression and returned only
+// the final table, hiding both settings and the import control.
+const originalCreateElement = context.React.createElement;
+context.React.createElement = (type, props, ...children) => ({ type, props: props || {}, children });
+const monthsAheadTree = get('MonthsAheadPanel')({
+  state: monthsState,
+  setState: noop,
+  grid: monthsSchedule.grid,
+  availability: monthsAvailability
+});
+context.React.createElement = originalCreateElement;
+assert.equal(monthsAheadTree.type, context.React.Fragment, 'Months Ahead must return a Fragment containing all forecast panels');
+assert.equal(monthsAheadTree.children.length, 3, 'Months Ahead must render settings, trajectory, and monthly plan panels');
+const monthsAheadText = JSON.stringify(monthsAheadTree, (_key, value) => typeof value === 'function' || typeof value === 'symbol' ? undefined : value);
+assert.match(monthsAheadText, /12-month scenario settings/);
+assert.match(monthsAheadText, /Import monthly results/);
+assert.match(monthsAheadText, /Service trajectory/);
+assert.match(monthsAheadText, /Monthly plan and forecast/);
+
 const averageGrids = get('averageGrids');
 const mkGrid = code => Array.from({ length: 7 }, () => [new Array(96).fill(code)]);
 const mixed = averageGrids([mkGrid('work'), mkGrid('break')]);

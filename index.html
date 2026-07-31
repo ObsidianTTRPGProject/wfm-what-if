@@ -719,6 +719,17 @@ const LAST_SEEN_VERSION_KEY = 'wfm-last-seen-version';
 // `tag` is one of 'feat' (new feature), 'fix' (bug fix), 'change' (behaviour change),
 // 'ui' (visual/interaction tweak). Plain strings default to 'feat'.
 const CHANGELOG = [{
+  version: '0.43.1',
+  date: '2026-07-31',
+  title: 'Months Ahead controls restored',
+  changes: [{
+    tag: 'fix',
+    text: 'Restored the 12-month scenario settings and service trajectory panels, including the monthly-results import button, which were omitted by an incorrect render grouping in v0.43.0.'
+  }, {
+    tag: 'change',
+    text: 'Added a render regression check so the Months Ahead tab must expose all three panels and the monthly-results import control.'
+  }]
+}, {
   version: '0.43.0',
   date: '2026-07-31',
   title: 'Monthly results import and shrinkage planning',
@@ -24659,7 +24670,7 @@ function MonthsAheadPanel({
     unit: "%",
     sub: asaText(last) + ' ASA · ' + (last.abandonPct * 100).toFixed(1) + '% abandon',
     tone: slTone(last)
-  })))), e("div", {
+  }))), e("div", {
     className: "panel"
   }, e("div", {
     className: "panel-h"
@@ -24771,7 +24782,7 @@ function MonthsAheadPanel({
     }, month.unstableIntervals, " overloaded int.")), e("td", {
       title: Math.round(month.monthlyAbandoned).toLocaleString() + ' forecast abandoned calls in this calendar month'
     }, (month.abandonPct * 100).toFixed(1), "% · ", Math.round(month.monthlyAbandoned).toLocaleString()));
-  })))));
+  }))))));
 }
 
 // ============================================================================
